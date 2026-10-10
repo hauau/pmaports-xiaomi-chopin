@@ -4,7 +4,7 @@
 maintainer="Stefan Hansson <newbyte@postmarketos.org>"
 pkgname=postmarketos-ui-phosh
 pkgver=33
-pkgrel=0
+pkgrel=1
 pkgdesc="(Wayland) Mobile UI using GNOME components and apps"
 url="https://phosh.mobi"
 arch="noarch !armhf"
@@ -73,7 +73,7 @@ package() {
 
 default_osk() {
 	install_if="$pkgname=$pkgver-r$pkgrel"
-	depends="phosh-osk-stub"
+	depends="stevia stevia-schemas"
 	mkdir -p "$subpkgdir"
 }
 
