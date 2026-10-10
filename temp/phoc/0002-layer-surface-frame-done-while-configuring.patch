@@ -1,0 +1,77 @@
+Keep sending frame events to layer surfaces with a pending configure.
+
+Frame events only go to surfaces intersecting the output. After a quick
+rotation the folded Phosh home surface can end its slide animation with the
+previous orientation's margin and sit fully off the output. GTK3 applies the
+new configure only on its next frame, so it never commits, the layout
+transaction times out after 3 s and the modeset shield blacks the screen.
+Do for configuring layer surfaces what phoc already does for invisible
+toplevels, and schedule a frame when such a surface commits so the
+callback arrives even when nothing on the output is damaged.
+
+--- a/src/output.c
++++ b/src/output.c
+@@ -639,6 +639,42 @@
+ 
+ 
+ static void
++layer_surface_send_frame_done_iterator (struct wlr_surface *wlr_surface,
++                                        int                 sx,
++                                        int                 sy,
++                                        void               *data)
++{
++  wlr_surface_send_frame_done (wlr_surface, data);
++}
++
++
++/*
++ * A layer surface can sit fully off the output, e.g. a folded draggable
++ * surface still using the margin of the previous orientation. GTK3 only
++ * applies a pending configure on its next frame, so without frame events
++ * it never commits and the layout transaction (and modeset shield) times
++ * out. Like invisible toplevels, keep it ticking until it commits.
++ */
++static void
++send_frame_done_to_configuring_layer_surfaces (PhocOutput *self, struct timespec *when)
++{
++  for (enum zwlr_layer_shell_v1_layer layer = ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND;
++       layer <= ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY; layer++) {
++    GQueue *layer_surfaces = phoc_output_get_layer_surfaces_for_layer (self, layer);
++
++    for (GList *l = layer_surfaces->head; l; l = l->next) {
++      PhocLayerSurface *layer_surface = PHOC_LAYER_SURFACE (l->data);
++
++      if (phoc_layer_surface_get_pending_serial (layer_surface))
++        wlr_layer_surface_v1_for_each_surface (layer_surface->layer_surface,
++                                               layer_surface_send_frame_done_iterator,
++                                               when);
++    }
++  }
++}
++
++
++static void
+ phoc_output_handle_frame (struct wl_listener *listener, void *data)
+ {
+   PhocOutputPrivate *priv = wl_container_of (listener, priv, frame);
+@@ -675,6 +711,7 @@
+   /* Send frame done events to all visible surfaces */
+   clock_gettime (CLOCK_MONOTONIC, &now);
+   phoc_output_for_each_surface (self, surface_send_frame_done_iterator, &now, true);
++  send_frame_done_to_configuring_layer_surfaces (self, &now);
+ 
+   /* Want frame clock ticking as long as we have frame callbacks */
+   if (priv->frame_callbacks)
+--- a/src/layer-surface.c
++++ b/src/layer-surface.c
+@@ -281,6 +281,10 @@
+     phoc_layout_transaction_notify_layer_configured (phoc_layout_transaction_get_default ());
+     self->pending_serial = 0;
+   }
++
++  /* Still configuring: ensure a frame event even if we're off the output */
++  if (self->pending_serial)
++    wlr_output_schedule_frame (wlr_output);
+ }
+ 
+ 

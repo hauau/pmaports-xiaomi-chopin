@@ -1,0 +1,23 @@
+From: chopin postmarketOS bring-up
+Subject: [PATCH] output-shield: dispose animation before its rectangle
+
+Disposing a playing timed animation skips it to completion and emits done.
+The shield's done callback calls stop_render(), which still needs color_rect.
+Clearing color_rect first makes that callback pass NULL to phoc_bling_unmap()
+and abort the compositor when a pending shield animation is torn down after
+the userspace freezer thaws. Dispose the animation while its target is alive.
+
+--- a/src/output-shield.c
++++ b/src/output-shield.c
+@@ -209,10 +209,10 @@ phoc_output_shield_finalize (GObject *object)
+   set_output (self, NULL);
+   stop_render (self);
+ 
++  g_clear_object (&self->animation);
+   g_clear_object (&self->color_rect);
+   g_clear_object (&self->easer);
+-  g_clear_object (&self->animation);
+   g_clear_object (&self->spinner);
+ 
+   G_OBJECT_CLASS (phoc_output_shield_parent_class)->finalize (object);
+ }
