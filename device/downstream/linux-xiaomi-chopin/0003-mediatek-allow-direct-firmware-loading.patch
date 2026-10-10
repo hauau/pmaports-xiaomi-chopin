@@ -1,0 +1,18 @@
+From: Nura chopin port
+Subject: [PATCH] mediatek: allow direct firmware loading without an Android helper
+
+Linux supplies connectivity firmware from the normal firmware search path.
+Forcing the Android user-helper fallback makes optional missing configuration
+files wait 60 seconds, exceeding the Wi-Fi power-on controller's timeout.
+Let the kernel configuration select the firmware loader policy instead.
+
+--- a/drivers/misc/mediatek/Kconfig
++++ b/drivers/misc/mediatek/Kconfig
+@@ -1,7 +1,6 @@
+ 
+ menuconfig MEDIATEK_SOLUTION
+ 	bool "MediaTek Properitary Configuration"
+-	select FW_LOADER_USER_HELPER_FALLBACK
+ 	select I2C
+ 	help
+ 	  Check this to enable MediaTek properity configuration.

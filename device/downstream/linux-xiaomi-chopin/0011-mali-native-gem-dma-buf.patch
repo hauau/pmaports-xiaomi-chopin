@@ -1,0 +1,205 @@
+Subject: [PATCH] mali/mediatek: import native GEM DMA-BUFs without ION
+
+Native kmsro allocates display buffers through DRM, not Android ION.
+The vendor wrapper currently rejects those exporters and reports ENOMEM.
+Keep ION configuration and protected-buffer handling for actual ION
+buffers, and use the existing DMA attachment and physical GPU-MMU path
+for ordinary GEM buffers. Iterate original physical segments instead of
+DMA-coalesced IOVA ranges, preserving the secure ION scatter-gather format.
+
+Transfer attachment ownership before fallible setup and release failed
+imports exactly once, without unmapping a nonexistent scatter-gather table.
+
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -51,4 +51,5 @@
+ #if IS_ENABLED(CONFIG_MTK_IOMMU_V2)
+ #include <asm/cacheflush.h>
++#include <mtk/ion_drv_priv.h>
+ static DEFINE_MUTEX(ion_config_lock);
+ #endif
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1174,7 +1174,10 @@
+ 	int err;
+ 	size_t count = 0;
+ 	struct kbase_mem_phy_alloc *alloc = reg->gpu_alloc;
++	bool physical_sg = false;
+ #if IS_ENABLED(CONFIG_MTK_IOMMU_V2)
+ 	struct ion_mm_data mm_data;
+ 	int retry_cnt = 0;
++
++	physical_sg = !alloc->imported.umm.ion_handle;
+ #endif
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1185,25 +1185,27 @@
+ #if IS_ENABLED(CONFIG_MTK_IOMMU_V2)
+-	mutex_lock(&ion_config_lock);
++	if (alloc->imported.umm.ion_handle) {
++		mutex_lock(&ion_config_lock);
+ 
+-	mm_data.mm_cmd = ION_MM_CONFIG_BUFFER;
+-	mm_data.config_buffer_param.kernel_handle =
+-			alloc->imported.umm.ion_handle;
+-	mm_data.config_buffer_param.module_id = M4U_PORT_GPU;
+-	mm_data.config_buffer_param.security = 0;
+-	mm_data.config_buffer_param.coherent = 0;
++		mm_data.mm_cmd = ION_MM_CONFIG_BUFFER;
++		mm_data.config_buffer_param.kernel_handle =
++				alloc->imported.umm.ion_handle;
++		mm_data.config_buffer_param.module_id = M4U_PORT_GPU;
++		mm_data.config_buffer_param.security = 0;
++		mm_data.config_buffer_param.coherent = 0;
+ 
+ retry:
+-	err = ion_kernel_ioctl(kctx->kbdev->client,
+-			ION_CMD_MULTIMEDIA, (unsigned long)&mm_data);
++		err = ion_kernel_ioctl(kctx->kbdev->client,
++				ION_CMD_MULTIMEDIA, (unsigned long)&mm_data);
+ 
+-	if (err == -ION_ERROR_CONFIG_CONFLICT && retry_cnt < 1000) {
+-		retry_cnt++;
+-		goto retry;
+-	} else if (err) {
+-		dev_warn(kctx->kbdev->dev,
+-				"fail to config ion buffer, err=%d, retry_cnt %d\n",
+-				err, retry_cnt);
+-		mutex_unlock(&ion_config_lock);
+-		return -EINVAL;
++		if (err == -ION_ERROR_CONFIG_CONFLICT && retry_cnt < 1000) {
++			retry_cnt++;
++			goto retry;
++		} else if (err) {
++			dev_warn(kctx->kbdev->dev,
++					"fail to config ion buffer, err=%d, retry_cnt %d\n",
++					err, retry_cnt);
++			mutex_unlock(&ion_config_lock);
++			return -EINVAL;
++		}
+ 	}
+ #endif
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1214,5 +1214,6 @@
+ #if IS_ENABLED(CONFIG_MTK_IOMMU_V2)
+-	mutex_unlock(&ion_config_lock);
++	if (alloc->imported.umm.ion_handle)
++		mutex_unlock(&ion_config_lock);
+ #endif
+ 
+ 	if (IS_ERR_OR_NULL(sgt))
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1224,5 +1224,7 @@
+ 	pa = kbase_get_gpu_phy_pages(reg);
+ 
+-	for_each_sg(sgt->sgl, s, sgt->nents, i) {
+-		size_t j, pages = PFN_UP(sg_dma_len(s));
++	/* GEM DMA mappings may coalesce non-contiguous physical segments. */
++	for_each_sg(sgt->sgl, s, physical_sg ? sgt->orig_nents : sgt->nents, i) {
++		size_t length = physical_sg ? s->length : sg_dma_len(s);
++		size_t j, pages = PFN_UP(length);
+ 		uint64_t phy_addr = 0;
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1255,3 +1255,3 @@
+-		WARN_ONCE(sg_dma_len(s) & (PAGE_SIZE-1),
+-		"sg_dma_len(s)=%u is not a multiple of PAGE_SIZE\n",
+-		sg_dma_len(s));
++		WARN_ONCE(length & (PAGE_SIZE-1),
++		"sg length=%zu is not a multiple of PAGE_SIZE\n",
++		length);
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1518,4 +1518,8 @@
+ 	if (IS_ERR_OR_NULL(reg->gpu_alloc))
+ 		goto no_alloc;
+ 
++	/* From here, the physical allocation owns the attachment and dma-buf. */
++	reg->gpu_alloc->imported.umm.dma_buf = dma_buf;
++	reg->gpu_alloc->imported.umm.dma_attachment = dma_attachment;
++	reg->gpu_alloc->imported.umm.kctx = kctx;
+ 	reg->cpu_alloc = kbase_mem_phy_alloc_get(reg->gpu_alloc);
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1539,8 +1539,5 @@
+ 	reg->gpu_alloc->type = KBASE_MEM_TYPE_IMPORTED_UMM;
+ 	reg->gpu_alloc->imported.umm.sgt = NULL;
+-	reg->gpu_alloc->imported.umm.dma_buf = dma_buf;
+-	reg->gpu_alloc->imported.umm.dma_attachment = dma_attachment;
+ 	reg->gpu_alloc->imported.umm.current_mapping_usage_count = 0;
+ 	reg->gpu_alloc->imported.umm.need_sync = need_sync;
+-	reg->gpu_alloc->imported.umm.kctx = kctx;
+ 	reg->extension = 0;
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1548,20 +1548,20 @@
+ #if IS_ENABLED(CONFIG_MTK_IOMMU_V2)
+-	/* 64-bit address range is the max */
+-	if (*va_pages > (U64_MAX / PAGE_SIZE))
+-		return NULL;
++	if (!IS_ERR(ion_drv_file_to_buffer(dma_buf->file))) {
++		if (kctx->kbdev->client == NULL) {
++			dev_warn(kctx->kbdev->dev, "invalid ion client!\n");
++			goto error_out;
++		}
+ 
+-	if (kctx->kbdev->client == NULL) {
+-		dev_warn(kctx->kbdev->dev, "invalid ion client!\n");
+-		return NULL;
++		ion_handle = ion_import_dma_buf(kctx->kbdev->client, dma_buf);
++		if (IS_ERR(ion_handle)) {
++			dev_warn(kctx->kbdev->dev, "import ion handle failed!\n");
++			goto error_out;
++		}
++
++		reg->gpu_alloc->imported.umm.ion_client = kctx->kbdev->client;
++		reg->gpu_alloc->imported.umm.ion_handle = ion_handle;
++	} else if (*flags & BASE_MEM_PROTECTED) {
++		/* Protected buffers must retain the trusted ION allocation path. */
++		goto error_out;
+ 	}
+-
+-	ion_handle = ion_import_dma_buf(kctx->kbdev->client, dma_buf);
+-
+-	if (IS_ERR(ion_handle)) {
+-		dev_warn(kctx->kbdev->dev, "import ion handle failed!\n");
+-		return NULL;
+-	}
+-
+-	reg->gpu_alloc->imported.umm.ion_client = kctx->kbdev->client;
+-	reg->gpu_alloc->imported.umm.ion_handle = ion_handle;
+ #endif
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1574,7 +1574,3 @@
+ 		err = kbase_mem_umm_map_attachment(kctx, reg);
+ 		if (err) {
+-#if IS_ENABLED(CONFIG_MTK_IOMMU_V2)
+-			ion_free(kctx->kbdev->client, ion_handle);
+-			ion_handle = NULL;
+-#endif
+ 			dev_warn(kctx->kbdev->dev,
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1591,7 +1591,11 @@
+ error_out:
+ 	kbase_mem_phy_alloc_put(reg->gpu_alloc);
+ 	kbase_mem_phy_alloc_put(reg->cpu_alloc);
++	goto free_reg;
+ no_alloc:
++	dma_buf_detach(dma_buf, dma_attachment);
++	dma_buf_put(dma_buf);
++free_reg:
+ 	kfree(reg);
+ 
+ 	return NULL;
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/mali_kbase_mem.c
+@@ -2929,3 +2929,4 @@
+ 	case KBASE_MEM_TYPE_IMPORTED_UMM:
+-		if (!IS_ENABLED(CONFIG_MALI_DMA_BUF_MAP_ON_DEMAND)) {
++		if (!IS_ENABLED(CONFIG_MALI_DMA_BUF_MAP_ON_DEMAND) &&
++		    alloc->imported.umm.sgt) {
+ 			WARN_ONCE(alloc->imported.umm.current_mapping_usage_count != 1,

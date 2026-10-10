@@ -1,0 +1,63 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Factory-calibrated CS35L41 audio startup for Xiaomi chopin"
+
+depend() {
+	need udev
+	after localmount
+	before greetd
+}
+
+load_calibration() {
+	local file=$1
+	local values
+
+	[ "$(wc -c < "$file")" -eq 8 ] || return 1
+	values=$(od -An -tu4 "$file") || return 1
+	set -- $values
+	[ "$#" -eq 2 ] || return 1
+	case "$1:$2" in *[!0-9:]*) return 1 ;; esac
+	[ "$1" -gt 0 ] && [ "$1" -le 16777215 ] || return 1
+	[ "$2" -gt 0 ] && [ "$2" -le 16777215 ] || return 1
+	amixer -q -c mt6885mt6359 cset "name='DSP Set CAL_Z'" "$1" &&
+		amixer -q -c mt6885mt6359 cset "name='RCV DSP Set CAL_Z'" "$2"
+}
+
+start() {
+	local persist=/run/xiaomi-chopin-audio
+	local ready=/run/xiaomi-chopin-audio-calibrated
+	local result file
+
+	ebegin "Loading Xiaomi chopin factory speaker calibration"
+	rm -f "$ready"
+	for file in cs35l41-dsp1-spk-prot.wmfw cs35l41-dsp1-spk-prot.bin \
+		RCV-cs35l41-dsp1-spk-prot.bin cs35l41-delta-spk-music.txt \
+		cs35l41-delta-rcv-music.txt; do
+		if [ ! -r "/lib/firmware/postmarketos/$file" ]; then
+			eerror "Missing stock speaker protection firmware: $file"
+			eend 1
+			return 1
+		fi
+	done
+	checkpath --directory --mode 0700 "$persist" || { eend 1; return 1; }
+	if ! mount -t ext4 -o ro,noload /dev/disk/by-partlabel/persist "$persist"; then
+		rmdir "$persist"
+		eend 1
+		return 1
+	fi
+	load_calibration "$persist/audio/cs35l41_cal.bin"
+	result=$?
+	umount "$persist" || result=1
+	rmdir "$persist" || result=1
+	if [ "$result" -eq 0 ]; then
+		checkpath --file --mode 0644 "$ready" || result=1
+	fi
+	eend "$result"
+}
+
+stop() {
+	ebegin "Withdrawing Xiaomi chopin speaker calibration readiness"
+	rm -f /run/xiaomi-chopin-audio-calibrated
+	eend $?
+}

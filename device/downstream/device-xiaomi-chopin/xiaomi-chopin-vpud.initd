@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Stock MediaTek video codec daemon (vpud) behind the V4L2 decoder and encoder"
+
+supervisor=supervise-daemon
+command=/usr/libexec/xiaomi-chopin-android-run
+# The kernel's mtk-vcodec devices refuse to open until vpud has registered
+# its firmware version over /dev/vcu. Layout mode 2 selects vpud's
+# uncompressed 16x32 block output, which the kernel offers as standard MM21
+# (GStreamer NV12_16L32S); the default UFO-compressed layout has no standard
+# equivalent.
+command_args="vpud xiaomi-chopin-vpud - - -32 -p vendor.mtk.vdec.frame.layout.mode=2
+	-d vcu -d ion -- /vendor/bin/vpud -f"
+respawn_delay=2
+
+depend() {
+	need xiaomi-chopin-stock
+}

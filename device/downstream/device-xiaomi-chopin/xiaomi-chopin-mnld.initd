@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Stock MediaTek GNSS daemon (mnld) for Xiaomi chopin"
+
+supervisor=supervise-daemon
+command=/usr/libexec/xiaomi-chopin-android-run
+# Android group 1000 (system) owns the factory GPS calibration in nvdata.
+# mnld arms CLOCK_BOOTTIME_ALARM timers and keeps its assistance data
+# (EPO/QEPO/MTKNAV) in /data/vendor/gps.
+command_args="mnld xiaomi-chopin-gnss 1000 wake_alarm -n -d gpsdl0 -d gpsdl1 -d gps_emi
+	-w /var/lib/xiaomi-chopin-gnss:/data/vendor/gps -- /vendor/bin/mnld"
+respawn_delay=2
+
+depend() {
+	need xiaomi-chopin-stock xiaomi-chopin-dnsproxyd xiaomi-chopin-gnss
+	after net
+}
+
+start_pre() {
+	checkpath --directory --mode 0700 --owner xiaomi-chopin-gnss:xiaomi-chopin-gnss \
+		/var/lib/xiaomi-chopin-gnss
+}

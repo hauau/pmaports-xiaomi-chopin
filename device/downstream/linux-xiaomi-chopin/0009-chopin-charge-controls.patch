@@ -1,0 +1,170 @@
+From: Nura chopin port <nura@localhost>
+Subject: [PATCH] power: expose independent ARES charge current and pump controls
+
+Add a user current vote without replacing JEITA, thermal, aging, or battery
+verification votes. Apply the effective vote to every SwitchCharging2 input
+type, including USB, and gate charging off when the aggregate limit is zero.
+The external power path is unchanged. Expose the existing charge-pump high
+voltage gate to privileged userspace so PPS/QC pump algorithms stay disabled.
+
+--- a/include/linux/power/mtk_charger_intf_mi.h
++++ b/include/linux/power/mtk_charger_intf_mi.h
+@@ -9,6 +9,7 @@ enum {
+ 	BAT_VERIFY_FCC,
+ 	COOL_MODE_FCC,
+ 	NIGHT_CHG_FCC,
++	USER_FCC,
+ 	CHG_MAX,
+ };
+ 
+--- a/drivers/power/supply/mediatek/charger_agate/mtk_charger.c
++++ b/drivers/power/supply/mediatek/charger_agate/mtk_charger.c
+@@ -1049,6 +1049,6 @@ int charger_manager_set_current_limit(int data, int type)
+ {
+ 	int effective_fcc = CURRENT_MAX;
+-	static int fcc[CHG_MAX] = {CURRENT_MAX, CURRENT_MAX, CURRENT_MAX, CURRENT_MAX, CURRENT_MAX, CURRENT_MAX, CURRENT_MAX};
++	static int fcc[CHG_MAX] = {[0 ... CHG_MAX - 1] = CURRENT_MAX};
+ 	union power_supply_propval val = {0,};
+ 	int i;
+ 
+--- a/drivers/power/supply/mediatek/charger_ares/mtk_charger.c
++++ b/drivers/power/supply/mediatek/charger_ares/mtk_charger.c
+@@ -945,6 +945,7 @@ int charger_manager_set_current_limit(int data, int type)
+ {
+ 	int effective_fcc = CURRENT_MAX;
+-	static int fcc[CHG_MAX] = {CURRENT_MAX, CURRENT_MAX, CURRENT_MAX, CURRENT_MAX, CURRENT_MAX, CURRENT_MAX, CURRENT_MAX};
++	static int fcc[CHG_MAX] = {[0 ... CHG_MAX - 1] = CURRENT_MAX};
++	static DEFINE_MUTEX(fcc_lock);
+ 	union power_supply_propval val = {0,};
+ 	int i = 0, batt_cycle_cnt = 0, rc = 0;
+ 
+@@ -971,8 +972,9 @@ int charger_manager_set_current_limit(int data, int type)
+-	if (data < 0) {
++	if (data < 0 || type < 0 || type >= CHG_MAX) {
+ 		pr_err("abnormal data, no set data\n");
+ 		return false;
+ 	}
+ 
++	mutex_lock(&fcc_lock);
+ 	switch (type) {
+ 	case STEPCHG_FCC:
+ 		fcc[STEPCHG_FCC] = data;
+@@ -1002,6 +1004,9 @@ int charger_manager_set_current_limit(int data, int type)
+ 		fcc[NIGHT_CHG_FCC] = data;
+ 		pr_info("fcc[NIGHT_CHG_FCC] = %d\n", fcc[NIGHT_CHG_FCC]);
+ 		break;
++	case USER_FCC:
++		fcc[USER_FCC] = data;
++		break;
+ 	default:
+ 		pr_err("abnormal type, no set effective_fcc\n");
+ 		break;
+@@ -1018,5 +1023,8 @@ int charger_manager_set_current_limit(int data, int type)
+ 	power_supply_set_property(pinfo->battery_psy,
+ 			POWER_SUPPLY_PROP_FAST_CHARGE_CURRENT, &val);
++	mutex_unlock(&fcc_lock);
++	if (type == USER_FCC)
++		_wake_up_charger(pinfo);
+ 
+ 	return true;
+ }
+@@ -2632,4 +2640,6 @@ static void charger_check_status(struct charger_manager *info)
+ 	if (info->cmd_discharging)
+ 		charging = false;
++	if (info->data.enable_vote && info->effective_fcc == 0)
++		charging = false;
+ 	if (info->safety_timeout)
+ 		charging = false;
+--- a/drivers/power/supply/mediatek/charger_ares/mtk_switch_charging2.c
++++ b/drivers/power/supply/mediatek/charger_ares/mtk_switch_charging2.c
+@@ -457,4 +457,8 @@ static void swchg_select_charging_current_limit(struct charger_manager *info)
+ done:
++	if (info->data.enable_vote)
++		pdata->charging_current_limit = min(pdata->charging_current_limit,
++						  info->effective_fcc);
++
+ 	ret = charger_dev_get_min_charging_current(info->chg1_dev, &ichg1_min);
+ 	if (ret != -ENOTSUPP && pdata->charging_current_limit < ichg1_min)
+ 		pdata->charging_current_limit = 0;
+@@ -771,3 +775,7 @@ static int select_pe40_charging_current_limit(struct charger_manager *info)
++	if (info->data.enable_vote)
++		pdata->charging_current_limit = min(pdata->charging_current_limit,
++						  info->effective_fcc);
++
+ 	ret = charger_dev_get_min_charging_current(info->chg1_dev, &ichg1_min);
+ 	if (ret != -ENOTSUPP && pdata->charging_current_limit < ichg1_min)
+ 		pdata->charging_current_limit = 0;
+@@ -899,3 +907,7 @@ static int select_pdc_charging_current_limit(struct charger_manager *info)
++	if (info->data.enable_vote)
++		pdata->charging_current_limit = min(pdata->charging_current_limit,
++						  info->effective_fcc);
++
+ 	ret = charger_dev_get_min_charging_current(info->chg1_dev, &ichg1_min);
+ 	if (ret != -ENOTSUPP && pdata->charging_current_limit < ichg1_min)
+ 		pdata->charging_current_limit = 0;
+--- a/drivers/power/supply/mediatek/battery_ares/mtk_battery.c
++++ b/drivers/power/supply/mediatek/battery_ares/mtk_battery.c
+@@ -115,4 +115,5 @@ static int battery_out_data[1] = { 0 };
+ #ifdef CONFIG_FUEL_GAUGE_BQ27Z561
+ static int fcc = 12400000;
++static int user_fcc = 12400000;
+ static int thermal_input_current = 6200000;
+ #endif
+@@ -138,2 +139,3 @@ static enum power_supply_property battery_props[] = {
+ 	POWER_SUPPLY_PROP_FAST_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+ 	POWER_SUPPLY_PROP_THERMAL_INPUT_CURRENT,
+@@ -619,6 +621,8 @@ static int mi_battery_get_property(struct power_supply *psy,
+ 		input_suspend = charger_manager_is_input_suspend();
+ 		if (input_suspend || chr_type == CHARGER_UNKNOWN)
+ 			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++		else if (user_fcc == 0)
++			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+ 		break;
+ 	case POWER_SUPPLY_PROP_HEALTH:
+ 		val->intval = data->BAT_HEALTH;
+@@ -689,6 +693,9 @@ static int mi_battery_get_property(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_FAST_CHARGE_CURRENT:
+ 		val->intval = fcc;
+ 		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		val->intval = user_fcc;
++		break;
+ 	case POWER_SUPPLY_PROP_THERMAL_INPUT_CURRENT:
+ 		val->intval = thermal_input_current;
+ 		break;
+@@ -728,2 +735,10 @@ static int mi_battery_set_property(struct power_supply *psy,
+ 	switch (psp) {
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		if (val->intval < 0 || val->intval > CURRENT_MAX)
++			return -EINVAL;
++		if (!charger_manager_set_current_limit(val->intval, USER_FCC))
++			return -EAGAIN;
++		user_fcc = val->intval;
++		power_supply_changed(psy);
++		break;
+ 	case POWER_SUPPLY_PROP_INPUT_SUSPEND:
+@@ -767,6 +782,7 @@ static int mi_battery_prop_is_writeable(struct power_supply *psy,
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_INPUT_SUSPEND:
+ 	case POWER_SUPPLY_PROP_NIGHT_CHARGING:
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+ 		return 1;
+ 	default:
+ 		break;
+--- a/drivers/power/supply/ti_ares/bq2597x_charger.c
++++ b/drivers/power/supply/ti_ares/bq2597x_charger.c
+@@ -2515,3 +2515,5 @@ static int bq2597x_charger_set_property(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_HV_CHARGE_ENABLED:
++		if (val->intval != 0 && val->intval != 1)
++			return -EINVAL;
+ 		bq->hv_charge_enable = val->intval;
+ 		break;
+@@ -2533,6 +2535,7 @@ static int bq2597x_charger_is_writeable(struct power_supply *psy,
+ 	switch (prop) {
+ 	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
+ 	case POWER_SUPPLY_PROP_TI_SET_BUS_PROTECTION_FOR_QC3:
++	case POWER_SUPPLY_PROP_HV_CHARGE_ENABLED:
+ 		ret = 1;
+ 		break;
+ 	default:

@@ -1,0 +1,132 @@
+# Reference: <https://postmarketos.org/vendorkernel>
+# Kernel config based on: arch/arm64/configs/chopin_defconfig (lineage-23.2)
+# This branch provides chopin_defconfig, not chopin_user_defconfig.
+# UFS, ext4, NBD and USB configfs networking are built-in for USB netboot.
+# Build: pmbootstrap build linux-xiaomi-chopin device-xiaomi-chopin
+# TKPMIXM RAM boot crashes LK even with stock boot.img.
+# Verified: full-size boot_a image with AVB footer, USB NBD rootfs and Nura/OpenRC.
+# Keep pmos.debug-shell disabled for netboot: its USB rebind interrupts NBD.
+maintainer="Sergei Shikalov <ssh@42px.org>"
+pkgname=linux-xiaomi-chopin
+pkgver=4.14.336
+pkgrel=26
+pkgdesc="Redmi Note 10 Pro 5G / POCO X3 GT downstream kernel"
+arch="aarch64"
+_carch="arm64"
+_flavor="xiaomi-chopin"
+_config="config-$_flavor.$arch"
+url="https://github.com/xiaomi-mt6893-dev/kernel_xiaomi_mt6893"
+license="GPL-2.0-only"
+options="!strip !check !tracedeps pmb:cross-native pmb:kconfigcheck-netboot"
+makedepends="
+	android-tools-mkdtboimg
+	bash
+	bc
+	bison
+	clang
+	devicepkg-dev
+	dtc
+	elfutils-dev
+	flex
+	linux-headers
+	lld
+	llvm
+	openssl-dev
+	perl
+	python3
+"
+_commit="aeb1327b1c73dfe71c4d0e184e5c1c419ee7291f"
+source="
+	$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz
+	$_config
+	0001-arm64-vdso32-use-lld-for-LLVM-builds.patch
+	use_system_dtc.patch
+	0002-loop-rescan-after-block-size.patch
+	0003-mediatek-allow-direct-firmware-loading.patch
+	0004-chopin-native-panel-backlight.patch
+	0005-vfs-faccessat2.patch
+	0006-drm-generic-prime-import.patch
+	0007-chopin-native-touch.patch
+	0008-pidfd-waitid.patch
+	0009-chopin-charge-controls.patch
+	0010-chopin-native-bluetooth.patch
+	0011-mali-native-gem-dma-buf.patch
+	0012-drm-unprivileged-prime-sharing.patch
+	0013-kcmp-independent-configuration.patch
+	0014-chopin-bluetooth-reboot-close.patch
+	0015-mali-native-implicit-dma-fences.patch
+	0016-close-range-clamp-to-fdtable.patch
+	0017-mtk-vcodec-dec-standard-clients.patch
+	0018-mtk-vcodec-dec-mmap-capture.patch
+	0019-mtk-vcodec-dec-displayed-buffer-ownership.patch
+	0020-mtk-vcodec-dec-visible-rectangle.patch
+	0021-mtk-vcodec-dec-mmap-bitstream-cache.patch
+	0022-proc-pidns-owner-superblock.patch
+	0023-mali-kbase-pid-namespaces.patch
+"
+builddir="$srcdir/kernel_xiaomi_mt6893-$_commit"
+# Preserve CRLF in the vendor BTIF source instead of stripping patch CRs.
+patch_args="-p1 --binary"
+_outdir="out"
+
+_make() {
+	make O="$_outdir" ARCH="$_carch" CC=clang HOSTCC=clang \
+		LLVM=1 LLVM_IAS=1 \
+		CROSS_COMPILE=aarch64-alpine-linux-musl- \
+		CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+		KBUILD_BUILD_VERSION="$((pkgrel + 1))-postmarketOS" "$@"
+}
+
+prepare() {
+	default_prepare
+	mkdir -p "$_outdir"
+	cp "$srcdir/$_config" "$_outdir/.config"
+	_make olddefconfig
+}
+
+build() {
+	unset LDFLAGS
+	_make Image.gz dtbs modules
+
+	# Stock header v2 contains a DT table with one MT6893 base DTB.
+	# Keep the existing device DTBO partition untouched during bring-up.
+	mkdtboimg create "$_outdir/dtb.img" --page_size=2048 \
+		"$_outdir/arch/$_carch/boot/dts/mediatek/mt6893.dtb"
+}
+
+package() {
+	KERNEL_IMAGE_NAME=Image.gz downstreamkernel_package \
+		"$builddir" "$pkgdir" "$_carch" "$_flavor" "$_outdir"
+	install -Dm644 "$_outdir/dtb.img" \
+		"$pkgdir/boot/dtbs/mediatek/mt6893-chopin-table.dtb"
+	_make modules_install INSTALL_MOD_PATH="$pkgdir/usr" INSTALL_MOD_STRIP=1
+	rm -f "$pkgdir"/usr/lib/modules/*/build "$pkgdir"/usr/lib/modules/*/source
+}
+sha512sums="
+4c626d9e753430f48b5269f65f02c90f3a5bd1a0d2d9e07c9ea3fc3a713bb8e6e05cf7f2f1a24e4138ff3c69612ab62f506a123436ba5dc40f5b73aa02545870  linux-xiaomi-chopin-aeb1327b1c73dfe71c4d0e184e5c1c419ee7291f.tar.gz
+62c31606238022319a506b2767de70e7a069ac74e2734a51e595adad3a5942a9d0dfafe751c916021e7292d2edb91e8796d0271ce1767f0d68ba8ca33c44450e  config-xiaomi-chopin.aarch64
+706b07bb2e5095a6e3d4b11f29110100ad31c7cfcc6a1a5f828b5dd6759aa3d582de5fc14f3ff44d1d0796caf87acff32db369c1abff45416dfc7508061c31d4  0001-arm64-vdso32-use-lld-for-LLVM-builds.patch
+c9e562403cd572c66def9adea434731b77617f7561f1ce1079e21e8f02e8fd9cc1febd7e52c581e8e4b1c4aca21c5ca8c5813d2006be13051048d681a640ab3d  use_system_dtc.patch
+7096075452b06c6a1505c883899fbb4c27b91efc2fad98105c63ff1404c86c7582daa52c23e7345c979f775afd6d07d06717cb1e345066f0276a9725e2486aca  0002-loop-rescan-after-block-size.patch
+73c43b4d987ed83549e771a0b4a50deb52a123e533357c17f9a8246795eeab7c8751105296c069026d548e7c8de6ac1c4ccd7e0615a0ad1c795da38297d305fa  0003-mediatek-allow-direct-firmware-loading.patch
+6fec99ea2f25086cd5255d09c79f91b423b3c000a86e7e668185071cfc9ff29072d5a8a03c9d8622d0750e452255dc0522247577d9a54bbf825e7a3a7416b323  0004-chopin-native-panel-backlight.patch
+a98041b2f9f71f452c0849cd9e288fe73467916488f60844ec3ecae3c8fee7dc057e266ad47ea7b6ef6e2160cce3e39dc74e39587f0fdfd7ca26b4dfd7ba10a0  0005-vfs-faccessat2.patch
+ac33ecc629614e9e3d37eab9e4c58ab779ed6e4d4478078dca832719edf42ad7551812a909dd3893a47a0ac5391d37cb000207ceb76def02b59a24331c5e3c84  0006-drm-generic-prime-import.patch
+6db2c15fc9cf2c6bc7cfbabce931bdd71cffd4621f417f556fc4d8ca0e41e2e0fa6c37a6f9038755853fd3a8d53975eb329349ecf077c3af4cc2b7a0032d3dcd  0007-chopin-native-touch.patch
+2d7afbafc78d2c6a7b54120c56ce28d5b4028212a474ff86500df575a593a327119dea7474beb11463641c3cb32d61a9046dd4ae3bf12e3c7af058d192e6b266  0008-pidfd-waitid.patch
+4d7c7a767b4460acf85bc55350becd4fd40bcc2715652dbf593e05e0e63dae3b3fd2cbb311211851759f94133c4c88d0b4fe57e27da675d492c2312646c08bc0  0009-chopin-charge-controls.patch
+1327a4e25fc574f359f35c9a90f031c3585ce9882d7c3cdc8d84d98341c9c01cb872f60552657f8d235fe4693d08fc5967e1ca0ba4e96f4e31a18473e44796c4  0010-chopin-native-bluetooth.patch
+a17213d045e636b93e5b16f7f2f118077a41587e7be337ec602928ef99891914f95c5ea3323ca7fdb61f411dfe885b2c2874b6deb2b633434f762d4d172144a1  0011-mali-native-gem-dma-buf.patch
+12ce180f0905f48bb5af6cd357d73da95af2d8d4d38c272e5e20066809814aad404ee65d3e85699a0ca77d11324d9b7069181e5e41bb0ad64696a98ce3d44318  0012-drm-unprivileged-prime-sharing.patch
+56555d1a02b100dfc95899e12f88d405094da64b670909bbbc3d8e855621872ce65fcb111d2cf3b900af78da594375e7803f30050bdd2dcdd697d280e136d2b0  0013-kcmp-independent-configuration.patch
+66f588142cb59f5b303f9fe8174163c67155c2afbc61c0163e062dc688fdb33f1c17ed2805593632287c5aad69f2757e401f41aa4515a3fa7ae63b3d6c51ce5a  0014-chopin-bluetooth-reboot-close.patch
+cbd5c9b837e31a1f071713806b46160e11d234b12f597889a4d16b3e462c5bbe8d62f6aaf2814b967fd9f2d40281e05b4b659acc62a4cba42474612aba2b03ef  0015-mali-native-implicit-dma-fences.patch
+5232020a4c4cef20d64f561aac0d12bb13cc625398a02a1546a77c6d534634858278cedc5b38b538e657653651328153c1deaeffe1f2269685457cc0ec6423f8  0016-close-range-clamp-to-fdtable.patch
+e3862b73769788b9cec79009b6e2b1fd918020e5913b79b72c68196e8a6f3dee553d44d5f178fb7c4020800963006fa99e0e6927d200d938c38fffd418cbc5a3  0017-mtk-vcodec-dec-standard-clients.patch
+5063e0e29861b23e9efe13eb9b14e17a07e9c9cb3f6c73081ec453aafad6f52aeab5580719930cb289142d0259b5465ec320593bb15795de8890fa789f39ccd0  0018-mtk-vcodec-dec-mmap-capture.patch
+2f6bce043d004c35c0200ad84855d0e0355d05f715c9a909ea9645ae572789b1caddb5fd75fe63d6a3129b70424fef250221a30c3e3a93c61fec4e2536b2d59f  0019-mtk-vcodec-dec-displayed-buffer-ownership.patch
+b0822638353bc0653fa32136661800e7982994721bca024c8d8d7bb6d5427d59fd75309001d45aa3e366e41e393264b6b8751ba903134cdab13fffc4563216e6  0020-mtk-vcodec-dec-visible-rectangle.patch
+8eb0f61725f7cc5517a1a4237d05249faaea4a52ac74aa84e2ec37095190a2c66cd6e18639b653962c88d10f1726acdf38d061e5bc85ebbcbf8ded7c9cd6e18c  0021-mtk-vcodec-dec-mmap-bitstream-cache.patch
+652db5f2b30064cedb5caaa03e8b392b5fdaa4b4187870af86571a98b3dbe21098769f8f4e6f9239c5ddb4969e058fbcb14f8a5ab2420fa97e9ef353f224e0a6  0022-proc-pidns-owner-superblock.patch
+8c463604a66526d540764e8b712111662748ff178cf7a05e68f4c16a829faa525ebcf26293ad34cc40f326871db055f81c6b70313f11b69c1f73d2b0f15a65fb  0023-mali-kbase-pid-namespaces.patch
+"

@@ -1,0 +1,19 @@
+Subject: [PATCH] loop: rescan partitions after changing the block size
+
+LOOP_SET_STATUS64 can enable LO_FLAGS_PARTSCAN before userspace applies
+LOOP_SET_BLOCK_SIZE. The initial scan then misses a GPT using 4096-byte
+sectors. Rescan after a successful block-size change, once the queue is
+unfrozen, as the other loop configuration paths already do.
+
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -1409,6 +1409,9 @@ static int loop_set_block_size(struct loop_device *lo, unsigned long arg)
+ out_unfreeze:
+ 	blk_mq_unfreeze_queue(lo->lo_queue);
+ 
++	if (!err && (lo->lo_flags & LO_FLAGS_PARTSCAN))
++		loop_reread_partitions(lo, lo->lo_device);
++
+ 	return err;
+ }
+ 

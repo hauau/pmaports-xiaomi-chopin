@@ -1,0 +1,25 @@
+From: postmarketOS chopin bring-up
+Subject: [PATCH] mali: enable implicit dma-buf fences for native DRM sharing
+
+Native userspace submits imported GEM dma-bufs as external resources. Without
+MALI_DMA_FENCE, those GPU jobs neither publish producer fences nor wait for
+other drivers' accesses. Poll then reports a buffer readable while its GPU
+writer is still pending.
+
+The MediaTek in-tree build bypasses Mali's Kconfig. Enable both the Kbuild
+objects and the matching preprocessor definition in its existing custom
+environment; leave the driver's explicit Android-fence opt-out unchanged.
+
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/Kbuild-mtk-custom-env
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/Kbuild-mtk-custom-env
+@@ -5,6 +5,10 @@
+ # build support for a ARM Mali Midgard GPU
+ CONFIG_MALI_MIDGARD := y
+ 
++# Native DRM sharing uses dma-buf reservation fences.
++CONFIG_MALI_DMA_FENCE := y
++ccflags-y += -DCONFIG_MALI_DMA_FENCE=1
++
+ # use mtk platform
+ CONFIG_MALI_PLATFORM_THIRDPARTY := y
+ ifeq ($(CONFIG_MACH_MT6833),y)

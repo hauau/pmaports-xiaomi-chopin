@@ -1,0 +1,101 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Run one stock Android vendor daemon of the Xiaomi chopin as an unprivileged
+# user in a private mount namespace. Its root holds only the read-only stock
+# system/vendor/system_ext partitions (mapped by the xiaomi-chopin-stock
+# service), the bionic and VNDK v31 APEX payloads, an Android property area,
+# and the device nodes and writable directories listed on the command line.
+#
+# usage: xiaomi-chopin-android-run NAME USER GIDS|- CAPS|- [-32] [-n]
+#            [-p KEY=VALUE]... [-d DEVNODE]... [-w HOSTDIR:ANDROIDDIR]... -- CMD [ARG]...
+#   GIDS  extra numeric (Android) group ids, comma separated
+#   CAPS  capabilities kept by the daemon, comma separated (e.g. wake_alarm)
+#   -32   32-bit daemon: use the lib instead of lib64 library directories
+#   -n    mount the factory nvdata partition read-only at /mnt/vendor/nvdata
+#   -p    set an Android system property for the daemon
+set -eu
+
+HELPER=/usr/libexec/xiaomi-chopin-android
+STOCK=/run/xiaomi-chopin-stock
+RUN=/run/xiaomi-chopin-android
+
+name=$1 user=$2 gids=$3 caps=$4
+shift 4
+lib=lib64 nvdata='' props='' devs='' binds=''
+while [ $# -gt 0 ] && [ "$1" != -- ]; do
+	case $1 in
+	-32) lib=lib; shift ;;
+	-n) nvdata=1; shift ;;
+	-p) props="$props $2"; shift 2 ;;
+	-d) devs="$devs $2"; shift 2 ;;
+	-w) binds="$binds $2"; shift 2 ;;
+	*) echo "unknown option $1" >&2; exit 2 ;;
+	esac
+done
+[ "${1:-}" = -- ] && shift
+[ $# -gt 0 ] || { echo "missing command" >&2; exit 2; }
+
+root=$RUN/root-$name
+
+if [ -z "${XIAOMI_CHOPIN_ANDROID_NS:-}" ]; then
+	for part in system_a vendor_a system_ext_a; do
+		grep -qs " $STOCK/$part ext4 ro," /proc/mounts ||
+			{ echo "$STOCK/$part is not mounted read-only" >&2; exit 1; }
+	done
+	mkdir -p "$root" "$RUN/socket"
+	"$HELPER" properties "$RUN/properties-$name" $props
+	# Re-run inside a private mount namespace with the parsed options.
+	# Built with set --, not echo: BusyBox echo swallows "-n".
+	set -- -- "$@"
+	rev=''
+	for b in $binds; do rev="$b $rev"; done
+	for b in $rev; do set -- -w "$b" "$@"; done
+	rev=''
+	for d in $devs; do rev="$d $rev"; done
+	for d in $rev; do set -- -d "$d" "$@"; done
+	[ -z "$nvdata" ] || set -- -n "$@"
+	[ "$lib" != lib ] || set -- -32 "$@"
+	XIAOMI_CHOPIN_ANDROID_NS=1 exec unshare -m --propagation private \
+		"$0" "$name" "$user" "$gids" "$caps" "$@"
+fi
+
+mount -t tmpfs -o mode=0755,nosuid,nodev chopin-android "$root"
+cd "$root"
+mkdir -p system vendor system_ext apex/com.android.runtime apex/com.android.vndk.v31 \
+	dev proc sys data tmp
+mount --bind -o ro "$STOCK/system_a/system" system
+mount --bind -o ro "$STOCK/vendor_a" vendor
+mount --bind -o ro "$STOCK/system_ext_a" system_ext
+# APEX zips store their ext4 payload uncompressed at a 4 KiB offset.
+mount -t ext4 -o ro,noload,loop,offset=4096 \
+	"$STOCK/system_a/system/apex/com.android.runtime.apex" apex/com.android.runtime
+mount -t ext4 -o ro,noload,loop,offset=4096 \
+	"$STOCK/system_ext_a/apex/com.android.vndk.v31.apex" apex/com.android.vndk.v31
+if [ -n "$nvdata" ]; then
+	# Factory calibration: read-only and without journal replay, never written.
+	mkdir -p mnt/vendor/nvdata
+	mount -t ext4 -o ro,noload /dev/disk/by-partlabel/nvdata mnt/vendor/nvdata
+fi
+
+mount -t tmpfs -o mode=0755,nosuid dev dev
+for n in null zero full random urandom $devs; do
+	: > "dev/$n"
+	mount --bind "/dev/$n" "dev/$n"
+done
+ln -s /proc/self/fd dev/fd
+mkdir dev/socket
+mount --bind "$RUN/socket" dev/socket
+: > dev/__properties__
+mount --bind -o ro "$RUN/properties-$name" dev/__properties__
+mount -t tmpfs -o mode=1777,nosuid,nodev tmp tmp
+mount -t proc -o nosuid,nodev,noexec proc proc
+mount --bind -o ro /sys sys
+for b in $binds; do
+	mkdir -p "$root${b#*:}"
+	mount --bind "${b%%:*}" "$root${b#*:}"
+done
+
+exec env -i PATH=/vendor/bin:/system/bin \
+	LD_LIBRARY_PATH=/apex/com.android.vndk.v31/$lib:/vendor/$lib:/vendor/$lib/hw:/apex/com.android.runtime/$lib/bionic:/system/$lib \
+	ANDROID_ROOT=/system ANDROID_DATA=/data ANDROID_NO_USE_FWMARK_CLIENT=1 \
+	"$HELPER" exec "$root" "$user" "$gids" "$caps" "$@"

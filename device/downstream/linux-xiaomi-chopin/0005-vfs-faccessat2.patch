@@ -1,0 +1,194 @@
+From: Nura chopin port
+Subject: [PATCH] vfs: add native faccessat2 with downstream permission checks
+
+Backport the upstream faccessat2 helper and syscall wrappers so flagged
+access checks use native VFS permissions rather than libc emulation.
+AT_EACCESS uses current credentials without allocating an override;
+default access checks retain the existing real-ID credential handling.
+Support AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH through existing lookup flags.
+Keep mount-aware inode_permission2, noexec, readonly and retry checks.
+The three-argument faccessat ABI and AArch32 compat table are unchanged.
+
+Adapted from upstream commit c8ffd8bcdd28296a198f237cc595148a8d4adfbe
+("vfs: add faccessat2 syscall"):
+https://android.googlesource.com/kernel/common/+/c8ffd8bcdd28296a198f237cc595148a8d4adfbe
+
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -359,10 +359,10 @@
+  * We do this by temporarily clearing all FS-related capabilities and
+  * switching the fsuid/fsgid around to the real ones.
+  */
+-SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+-{
+-	const struct cred *old_cred;
+-	struct cred *override_cred;
++static long do_faccessat(int dfd, const char __user *filename, int mode, int flags)
++{
++	const struct cred *old_cred = NULL;
++	struct cred *override_cred = NULL;
+ 	struct path path;
+ 	struct inode *inode;
+ 	struct vfsmount *mnt;
+@@ -372,43 +372,54 @@
+ 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+ 		return -EINVAL;
+ 
+-	override_cred = prepare_creds();
+-	if (!override_cred)
+-		return -ENOMEM;
+-
+-	override_cred->fsuid = override_cred->uid;
+-	override_cred->fsgid = override_cred->gid;
+-
+-	if (!issecure(SECURE_NO_SETUID_FIXUP)) {
+-		/* Clear the capabilities if we switch to a non-root user */
+-		kuid_t root_uid = make_kuid(override_cred->user_ns, 0);
+-		if (!uid_eq(override_cred->uid, root_uid))
+-			cap_clear(override_cred->cap_effective);
+-		else
+-			override_cred->cap_effective =
+-				override_cred->cap_permitted;
+-	}
+-
+-	/*
+-	 * The new set of credentials can *only* be used in
+-	 * task-synchronous circumstances, and does not need
+-	 * RCU freeing, unless somebody then takes a separate
+-	 * reference to it.
+-	 *
+-	 * NOTE! This is _only_ true because this credential
+-	 * is used purely for override_creds() that installs
+-	 * it as the subjective cred. Other threads will be
+-	 * accessing ->real_cred, not the subjective cred.
+-	 *
+-	 * If somebody _does_ make a copy of this (using the
+-	 * 'get_current_cred()' function), that will clear the
+-	 * non_rcu field, because now that other user may be
+-	 * expecting RCU freeing. But normal thread-synchronous
+-	 * cred accesses will keep things non-RCY.
+-	 */
+-	override_cred->non_rcu = 1;
+-
+-	old_cred = override_creds(override_cred);
++	if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
++		return -EINVAL;
++
++	if (flags & AT_SYMLINK_NOFOLLOW)
++		lookup_flags &= ~LOOKUP_FOLLOW;
++	if (flags & AT_EMPTY_PATH)
++		lookup_flags |= LOOKUP_EMPTY;
++
++	if (!(flags & AT_EACCESS)) {
++		override_cred = prepare_creds();
++		if (!override_cred)
++			return -ENOMEM;
++
++		override_cred->fsuid = override_cred->uid;
++		override_cred->fsgid = override_cred->gid;
++
++		if (!issecure(SECURE_NO_SETUID_FIXUP)) {
++			/* Clear the capabilities if we switch to a non-root user */
++			kuid_t root_uid = make_kuid(override_cred->user_ns, 0);
++			if (!uid_eq(override_cred->uid, root_uid))
++				cap_clear(override_cred->cap_effective);
++			else
++				override_cred->cap_effective =
++					override_cred->cap_permitted;
++		}
++
++		/*
++		 * The new set of credentials can *only* be used in
++		 * task-synchronous circumstances, and does not need
++		 * RCU freeing, unless somebody then takes a separate
++		 * reference to it.
++		 *
++		 * NOTE! This is _only_ true because this credential
++		 * is used purely for override_creds() that installs
++		 * it as the subjective cred. Other threads will be
++		 * accessing ->real_cred, not the subjective cred.
++		 *
++		 * If somebody _does_ make a copy of this (using the
++		 * 'get_current_cred()' function), that will clear the
++		 * non_rcu field, because now that other user may be
++		 * expecting RCU freeing. But normal thread-synchronous
++		 * cred accesses will keep things non-RCY.
++		 */
++		override_cred->non_rcu = 1;
++
++		old_cred = override_creds(override_cred);
++	}
++
+ retry:
+ 	res = user_path_at(dfd, filename, lookup_flags, &path);
+ 	if (res)
+@@ -451,9 +462,22 @@
+ 		goto retry;
+ 	}
+ out:
+-	revert_creds(old_cred);
+-	put_cred(override_cred);
++	if (old_cred) {
++		revert_creds(old_cred);
++		put_cred(override_cred);
++	}
+ 	return res;
++}
++
++SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
++{
++	return do_faccessat(dfd, filename, mode, 0);
++}
++
++SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename, int, mode,
++		int, flags)
++{
++	return do_faccessat(dfd, filename, mode, flags);
+ }
+ 
+ SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -816,6 +816,8 @@
+ asmlinkage long sys_futimesat(int dfd, const char __user *filename,
+ 			      struct timeval __user *utimes);
+ asmlinkage long sys_faccessat(int dfd, const char __user *filename, int mode);
++asmlinkage long sys_faccessat2(int dfd, const char __user *filename, int mode,
++			       int flags);
+ asmlinkage long sys_fchmodat(int dfd, const char __user * filename,
+ 			     umode_t mode);
+ asmlinkage long sys_fchownat(int dfd, const char __user *filename, uid_t user,
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -738,6 +738,8 @@
+ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+ #define __NR_close_range 436
+ __SYSCALL(__NR_close_range, sys_close_range)
++#define __NR_faccessat2 439
++__SYSCALL(__NR_faccessat2, sys_faccessat2)
+ #define __NR_epoll_pwait2 441
+ __SC_COMP(__NR_epoll_pwait2, sys_epoll_pwait2, compat_sys_epoll_pwait2)
+ 
+--- a/include/uapi/linux/fcntl.h
++++ b/include/uapi/linux/fcntl.h
+@@ -76,10 +76,20 @@
+ #define DN_ATTRIB	0x00000020	/* File changed attibutes */
+ #define DN_MULTISHOT	0x80000000	/* Don't remove notifier */
+ 
++/*
++ * The constants AT_REMOVEDIR and AT_EACCESS have the same value.  AT_EACCESS is
++ * meaningful only to faccessat, while AT_REMOVEDIR is meaningful only to
++ * unlinkat.  The two functions do completely different things and therefore,
++ * the flags can be allowed to overlap.  For example, passing AT_REMOVEDIR to
++ * faccessat would be undefined behavior and thus treating it equivalent to
++ * AT_EACCESS is valid undefined behavior.
++ */
+ #define AT_FDCWD		-100    /* Special value used to indicate
+                                            openat should use the current
+                                            working directory. */
+ #define AT_SYMLINK_NOFOLLOW	0x100   /* Do not follow symbolic links.  */
++#define AT_EACCESS		0x200	/* Test access permitted for
++                                           effective IDs, not real IDs.  */
+ #define AT_REMOVEDIR		0x200   /* Remove directory instead of
+                                            unlinking file.  */
+ #define AT_SYMLINK_FOLLOW	0x400   /* Follow symbolic links.  */

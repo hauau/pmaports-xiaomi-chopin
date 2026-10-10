@@ -1,0 +1,57 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Read-only stock Android partitions for the Xiaomi chopin vendor daemons"
+
+stock=/run/xiaomi-chopin-stock
+partitions="system_a vendor_a system_ext_a"
+
+depend() {
+	need udev
+	after localmount
+}
+
+map_partition() {
+	local super=$1 name=$2 start=$3 sectors=$4
+	local dev=xiaomi-chopin-stock-$name
+
+	if ! dmsetup info "$dev" >/dev/null 2>&1; then
+		echo "0 $sectors linear $super $start" | dmsetup create --readonly "$dev" || return 1
+	fi
+	# The mapping itself must be read-only, not just the mount.
+	[ "$(cat "/sys/dev/block/$(dmsetup info -c --noheadings -o major,minor "$dev" | tr -d ' ')/ro")" = 1 ] ||
+		return 1
+	mkdir -p "$stock/$name"
+	grep -qs " $stock/$name " /proc/mounts ||
+		mount -t ext4 -o ro,noload "/dev/mapper/$dev" "$stock/$name"
+}
+
+start() {
+	local super extents
+
+	ebegin "Mapping the stock Android partitions of Xiaomi chopin read-only"
+	super=$(readlink -f /dev/disk/by-partlabel/super) &&
+		extents=$(/usr/libexec/xiaomi-chopin-android super-extents "$super" $partitions) || {
+		eend 1
+		return 1
+	}
+	echo "$extents" | while read -r name start sectors; do
+		map_partition "$super" "$name" "$start" "$sectors" || exit 1
+	done
+	eend $?
+}
+
+stop() {
+	local name result=0
+
+	ebegin "Unmapping the stock Android partitions of Xiaomi chopin"
+	for name in $partitions; do
+		if grep -qs " $stock/$name " /proc/mounts; then
+			umount "$stock/$name" || result=1
+		fi
+		if dmsetup info "xiaomi-chopin-stock-$name" >/dev/null 2>&1; then
+			dmsetup remove "xiaomi-chopin-stock-$name" || result=1
+		fi
+	done
+	eend $result
+}

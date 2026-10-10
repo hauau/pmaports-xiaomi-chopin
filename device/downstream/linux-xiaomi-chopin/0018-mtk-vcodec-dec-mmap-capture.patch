@@ -1,0 +1,75 @@
+mtk-vcodec: decoder: support MMAP buffers.
+
+vpud maps every decoded frame buffer and bitstream buffer by dma-buf: the
+driver passes planes[i].dbuf to it as a file descriptor, and mtk-vcu
+registers that dma-buf for vpud's cache maintenance. Only DMABUF
+(imported) buffers have one. With MMAP buffers, as used by FFmpeg and
+GStreamer, the decoder worker dereferenced NULL and left the m2m job
+running (blocking every later release and open), vpud received fd 0
+instead of the bitstream, and its cache maintenance requests found no
+buffer, so it parsed stale input and frames repeated or mixed.
+
+vb2 core manages planes[i].dbuf only for DMABUF queues. For MMAP buffers,
+export one dma-buf per plane when the buffer is initialized, keep it in
+planes[i].dbuf so every existing path treats the buffer like an imported
+one, and drop it when the buffer is cleaned up.
+
+--- a/drivers/media/platform/mtk-vcodec/mtk_vcodec_dec.c
++++ b/drivers/media/platform/mtk-vcodec/mtk_vcodec_dec.c
+@@ -2456,6 +2456,20 @@
+ 	}
+ }
+ 
++/* Drop the dma-bufs exported for MMAP planes in vb2ops_vdec_buf_init. */
++static void mtk_vdec_put_mmap_dbufs(struct vb2_buffer *vb)
++{
++	unsigned int i;
++
++	if (vb->vb2_queue->memory != VB2_MEMORY_MMAP)
++		return;
++	for (i = 0; i < vb->num_planes; i++) {
++		if (vb->planes[i].dbuf)
++			dma_buf_put(vb->planes[i].dbuf);
++		vb->planes[i].dbuf = NULL;
++	}
++}
++
+ static void vb2ops_vdec_buf_cleanup(struct vb2_buffer *vb)
+ {
+ 	int i;
+@@ -2479,6 +2493,7 @@
+ 		}
+ 		mutex_unlock(&ctx->buf_lock);
+ 	}
++	mtk_vdec_put_mmap_dbufs(vb);
+ }
+ 
+ static int vb2ops_vdec_buf_init(struct vb2_buffer *vb)
+@@ -2511,6 +2526,27 @@
+ 	} else {
+ 		mtk_v4l2_err("vb2ops_vdec_buf_init: unknown queue type");
+ 		return -EINVAL;
++	}
++
++	/*
++	 * vpud maps frame and bitstream buffers by dma-buf: the driver hands
++	 * it planes[i].dbuf as a file descriptor and mtk-vcu registers that
++	 * dma-buf for vpud's cache maintenance. Standard clients such as
++	 * FFmpeg and GStreamer use MMAP buffers, which have none; vb2 core
++	 * only manages planes[i].dbuf for DMABUF queues, so export one per
++	 * plane here and keep it there until buf_cleanup.
++	 */
++	for (i = 0; vb->vb2_queue->memory == VB2_MEMORY_MMAP &&
++	     i < vb->num_planes; i++) {
++		if (vb->planes[i].dbuf)
++			continue;
++		vb->planes[i].dbuf = vb->vb2_queue->mem_ops->get_dmabuf(
++			vb->planes[i].mem_priv, O_RDWR);
++		if (IS_ERR_OR_NULL(vb->planes[i].dbuf)) {
++			vb->planes[i].dbuf = NULL;
++			mtk_vdec_put_mmap_dbufs(vb);
++			return -ENOMEM;
++		}
+ 	}
+ 
+ 	return 0;

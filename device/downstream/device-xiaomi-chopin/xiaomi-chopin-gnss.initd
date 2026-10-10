@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="NMEA bridge from the Xiaomi chopin GNSS daemon to geoclue"
+
+supervisor=supervise-daemon
+command=/usr/libexec/xiaomi-chopin-gnss
+command_args=/run/xiaomi-chopin-gnss/nmea.sock
+command_user=xiaomi-chopin-gnss:geoclue
+output_log=/var/log/xiaomi-chopin-gnss.log
+error_log=/var/log/xiaomi-chopin-gnss.log
+
+depend() {
+	# Claim mnld's report socket before mnld starts sending to it.
+	before xiaomi-chopin-mnld
+}
+
+start_pre() {
+	checkpath --directory --mode 0750 --owner xiaomi-chopin-gnss:geoclue /run/xiaomi-chopin-gnss &&
+		checkpath --file --mode 0640 --owner xiaomi-chopin-gnss:xiaomi-chopin-gnss \
+			/var/log/xiaomi-chopin-gnss.log
+}

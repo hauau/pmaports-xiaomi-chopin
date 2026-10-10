@@ -1,0 +1,64 @@
+mtk-vcodec: decoder: report the visible rectangle as default compose.
+
+COMPOSE_DEFAULT returned the coded picture size (1920x1088 for 1080p
+H.264), so clients that take the visible area from it, like GStreamer,
+displayed the padding rows. Return the stream's crop rectangle from vpud
+for the default targets as well, as the stateful decoder interface
+specifies.
+
+GET_PARAM_CROP_INFO fills a struct v4l2_crop, but G_SELECTION passed the
+bare rectangle, so COMPOSE/CROP came back shifted by one field (width 0,
+height 1920) and the copy ran 4 bytes past the rectangle. Use a
+struct v4l2_crop and copy its rectangle.
+
+--- a/drivers/media/platform/mtk-vcodec/mtk_vcodec_dec.c
++++ b/drivers/media/platform/mtk-vcodec/mtk_vcodec_dec.c
+@@ -1545,6 +1545,7 @@
+ {
+ 	struct mtk_vcodec_ctx *ctx = fh_to_ctx(priv);
+ 	struct mtk_q_data *q_data;
++	struct v4l2_crop crop = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+ 
+ 	if (s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+ 		return -EINVAL;
+@@ -1552,13 +1553,6 @@
+ 	q_data = &ctx->q_data[MTK_Q_DATA_DST];
+ 
+ 	switch (s->target) {
+-	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+-	case V4L2_SEL_TGT_CROP_DEFAULT:
+-		s->r.left = 0;
+-		s->r.top = 0;
+-		s->r.width = ctx->picinfo.pic_w;
+-		s->r.height = ctx->picinfo.pic_h;
+-		break;
+ 	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+ 	case V4L2_SEL_TGT_CROP_BOUNDS:
+ 		s->r.left = 0;
+@@ -1566,14 +1560,22 @@
+ 		s->r.width = ctx->picinfo.buf_w;
+ 		s->r.height = ctx->picinfo.buf_h;
+ 		break;
++	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
+ 	case V4L2_SEL_TGT_COMPOSE:
+ 	case V4L2_SEL_TGT_CROP:
+-		if (vdec_if_get_param(ctx, GET_PARAM_CROP_INFO, &(s->r))) {
+-			/* set to default value if header info not ready yet*/
++		/* The stream's visible rectangle (e.g. 1920x1080 of a 1920x1088
++		 * picture) is the default compose area of a stateful decoder;
++		 * GStreamer reads only COMPOSE_DEFAULT. GET_PARAM_CROP_INFO
++		 * fills a struct v4l2_crop, not a bare rectangle. */
++		if (vdec_if_get_param(ctx, GET_PARAM_CROP_INFO, &crop) == 0 &&
++		    crop.c.width && crop.c.height) {
++			s->r = crop.c;
++		} else {
+ 			s->r.left = 0;
+ 			s->r.top = 0;
+-			s->r.width = q_data->visible_width;
+-			s->r.height = q_data->visible_height;
++			s->r.width = ctx->picinfo.pic_w;
++			s->r.height = ctx->picinfo.pic_h;
+ 		}
+ 		break;
+ 	default:

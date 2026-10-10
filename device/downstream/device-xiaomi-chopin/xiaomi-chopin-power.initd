@@ -1,0 +1,34 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Idle-power and suspend defaults for Xiaomi chopin"
+
+depend() {
+	need udev
+	after localmount
+	before greetd
+}
+
+start() {
+	local boost control
+
+	ebegin "Applying Xiaomi chopin idle-power and suspend defaults"
+	# Vendor LPM debugging disables console suspend and forces VT switching.
+	# Honor the native fbdev's skip_vt_switch with normal console suspension.
+	printf 'Y\n' > /sys/module/printk/parameters/console_suspend || {
+		eend 1
+		return 1
+	}
+	# USB traffic otherwise holds all CPU clusters near their maximum clocks.
+	# Release only the USB kicker; leave native governors and other limits intact.
+	for boost in cpu_freq cpu_core dram_vcore; do
+		control="/sys/class/usb_boost/$boost/enable"
+		# The vendor supplies store handlers but creates these attributes 0400.
+		chmod 0600 "$control" || { eend 1; return 1; }
+		printf '0\n' > "$control" || {
+			eend 1
+			return 1
+		}
+	done
+	eend 0
+}

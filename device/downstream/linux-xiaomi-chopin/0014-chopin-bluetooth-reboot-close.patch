@@ -1,0 +1,101 @@
+From: Chopin bring-up <chopin@localhost>
+Subject: [PATCH] bluetooth: close registered controllers through the HCI core on reboot
+
+The MT66xx reboot notifier duplicates the USB/SDIO disconnect state
+machine. Native BTIF publishes g_sbdev directly and has no CIF event
+table, so an active controller makes SYS_RESTART dereference address 3
+at the DISCONNECT event's ops_enter field.
+
+Use hci_dev_close() for the registered native HCI devices instead. The
+HCI core serializes requests, drains work and invokes the existing
+transport-aware bt_close callback. That callback already skips the
+USB/SDIO deinitialization command for MT66xx and performs the real BTIF
+power-off. Keep the notifier and radio teardown; do not bypass the fault
+by disabling Bluetooth before reboot or suppressing the callback.
+
+--- a/drivers/misc/mediatek/connectivity/bt/mt66xx/btmtk_main.c
++++ b/drivers/misc/mediatek/connectivity/bt/mt66xx/btmtk_main.c
+@@ -3931,73 +3931,21 @@
+-	int ret = 0;
+ 	int i = 0;
+-	int cif_event = 0;
+-	unsigned char fstate = 0;
+-	int state = 0;
+-	struct btmtk_cif_state *cif_state = NULL;
+-	struct btmtk_dev *bdev = NULL;
+ 
+ 	BTMTK_INFO("%s: btmtk_reboot_notify(%d)", __func__, (int)event);
+ 
+ 	if (event == SYS_RESTART) {
+ 		BTMTK_INFO("%s: enter", __func__);
+ 		for (i = 0; i < btmtk_intf_num; i++) {
+-			/* Find valid dev for already probe interface. */
+-			if (g_bdev[i]->hdev != NULL) {
+-				bdev = g_bdev[i];
+-
+-				fstate = btmtk_fops_get_state(bdev);
+-				if (fstate != BTMTK_FOPS_STATE_OPENED) {
+-					BTMTK_WARN("%s: fops is not opened(%d)", __func__, fstate);
+-					continue;
+-				}
+-
+-				state = btmtk_get_chip_state(bdev);
+-				if (state != BTMTK_STATE_WORKING) {
+-					BTMTK_WARN("%s: not in working(%d).", __func__, state);
+-					continue;
+-				}
+-
+-				cif_event = HIF_EVENT_DISCONNECT;
+-				if (BTMTK_CIF_IS_NULL(bdev, cif_event)) {
+-					/* Error */
+-					BTMTK_WARN("%s parameter is NULL", __func__);
+-					continue;
+-				}
+-
+-				cif_state = &bdev->cif_state[cif_event];
+-				/* Set Entering state */
+-				btmtk_set_chip_state((void *)bdev, cif_state->ops_enter);
+-
+-				btmtk_fops_set_state(bdev, BTMTK_FOPS_STATE_CLOSING);
+-
+-				if (main_info.hif_hook.cif_mutex_lock)
+-					main_info.hif_hook.cif_mutex_lock(bdev);
+-
+-				ret = btmtk_send_deinit_cmds(bdev);
+-				if (ret < 0)
+-					BTMTK_ERR("%s, btmtk_send_deinit_cmds failed", __func__);
+-#if 0
+-				/* Flush RX works */
+-				flush_work(&bdev->rx_work);
+-
+-				/* Drop queues */
+-				skb_queue_purge(&bdev->rx_q);
+-#endif
+-				main_info.hif_hook.close(bdev->hdev);
+-
+-				if (main_info.hif_hook.cif_mutex_unlock)
+-					main_info.hif_hook.cif_mutex_unlock(bdev);
+-
+-				btmtk_fops_set_state(bdev, BTMTK_FOPS_STATE_CLOSED);
+-
+-				/* Set End/Error state */
+-				if (ret == 0)
+-					btmtk_set_chip_state((void *)bdev, cif_state->ops_end);
+-				else
+-					btmtk_set_chip_state((void *)bdev, cif_state->ops_error);
+-			}
++			struct btmtk_dev *bdev = g_bdev[i];
++			int ret;
++
++			if (!bdev->hdev)
++				continue;
++
++			ret = hci_dev_close(bdev->hdev->id);
++			if (ret)
++				BTMTK_ERR("%s: HCI close failed (%d)", __func__, ret);
+ 		}
+ 	}
+ 
+-	return 0;
++	return NOTIFY_DONE;
+ }

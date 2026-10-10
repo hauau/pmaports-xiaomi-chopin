@@ -1,0 +1,154 @@
+Subject: [PATCH] drm/mediatek: use generic PRIME DMA-BUF import
+
+The downstream ION wrapper rejects native GEM DMA-BUFs and its profiling
+then dereferences the returned ERR_PTR while object_name_lock is held.
+Phoc consequently dies in the kernel and subsequent DRM opens and seat
+operations cannot complete. Use the existing generic importer, including
+its same-device GEM reuse and attachment lifetime rules. Remove the
+now-unused ION import wrapper and GEM-only ION reference bookkeeping;
+other vendor ION clients and secure-buffer paths remain unchanged.
+
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -3320,7 +3320,7 @@
+ 	.prime_handle_to_fd = drm_gem_prime_handle_to_fd,
+ 	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
+ 	.gem_prime_export = drm_gem_prime_export,
+-	.gem_prime_import = mtk_gem_prime_import,
++	.gem_prime_import = drm_gem_prime_import,
+ 	.gem_prime_get_sg_table = mtk_gem_prime_get_sg_table,
+ 	.gem_prime_import_sg_table = mtk_gem_prime_import_sg_table,
+ 	.gem_prime_mmap = mtk_drm_gem_mmap_buf,
+--- a/drivers/gpu/drm/mediatek/mtk_drm_gem.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_gem.c
+@@ -283,14 +283,5 @@
+ 			       mtk_gem->dma_addr, mtk_gem->dma_attrs,
+ 			       __func__, __LINE__);
+-
+-#if defined(CONFIG_MTK_IOMMU_V2)
+-	/* No ion handle in dumb buffer */
+-	if (mtk_gem->handle && priv->client)
+-		mtk_drm_gem_ion_free_handle(priv->client, mtk_gem->handle,
+-				__func__, __LINE__);
+-	else if (!mtk_gem->is_dumb)
+-		DDPPR_ERR("invaild ion handle or client\n");
+-#endif
+ 
+ 	/* release file pointer to gem object. */
+ 	drm_gem_object_release(obj);
+@@ -322,8 +313,6 @@
+ 	/* drop reference from allocate - handle holds it now. */
+ 	drm_gem_object_unreference_unlocked(&mtk_gem->base);
+ 
+-	mtk_gem->is_dumb = 1;
+-
+ 	return 0;
+ 
+ err_handle_create:
+@@ -403,29 +392,6 @@
+ }
+ 
+ #if defined(CONFIG_MTK_IOMMU_V2)
+-struct ion_handle *mtk_gem_ion_import_dma_buf(struct ion_client *client,
+-		struct dma_buf *dmabuf, const char *name, int line)
+-{
+-	struct ion_handle *handle;
+-
+-	DDPDBG("%s:%d client:0x%p, dma_buf=0x%p, name:%s, line:%d +\n",
+-		   __func__, __LINE__,
+-		   client,
+-		   dmabuf,
+-		   name,
+-		   line);
+-	DRM_MMP_EVENT_START(ion_import_dma, (unsigned long)client, line);
+-	handle = ion_import_dma_buf(client, dmabuf);
+-
+-	DRM_MMP_EVENT_END(ion_import_dma, (unsigned long)handle->buffer,
+-			(unsigned long)dmabuf);
+-	DDPDBG("%s:%d handle:0x%p -\n",
+-		   __func__, __LINE__,
+-		   handle);
+-
+-	return handle;
+-}
+-
+ struct ion_handle *mtk_gem_ion_import_dma_fd(struct ion_client *client,
+ 		int fd, const char *name, int line)
+ {
+@@ -549,53 +515,6 @@
+ 	return handle;
+ }
+ #endif
+-
+-/* Generate drm_gem_object from dma_buf which get from prime fd in DRM core
+- * check drm_gem_prime_fd_to_handle
+- */
+-struct drm_gem_object *
+-mtk_gem_prime_import(struct drm_device *dev, struct dma_buf *dma_buf)
+-{
+-	struct drm_gem_object *obj;
+-	struct mtk_drm_gem_obj *mtk_gem;// = to_mtk_gem_obj(obj);
+-#if defined(CONFIG_MTK_IOMMU_V2)
+-	struct mtk_drm_private *priv = dev->dev_private;
+-	struct ion_client *client;
+-	struct ion_handle *handle;
+-
+-	DDPDBG("%s:%d dev:0x%p, dma_buf=0x%p +\n",
+-		   __func__, __LINE__,
+-		   dev,
+-		   dma_buf);
+-
+-	client = priv->client;
+-	handle = mtk_gem_ion_import_dma_buf(client, dma_buf,
+-			__func__, __LINE__);
+-	if (IS_ERR(handle)) {
+-		DDPPR_ERR("ion import failed, client:0x%p, dmabuf:0x%p\n",
+-				client, dma_buf);
+-		return ERR_PTR(-EINVAL);
+-	}
+-
+-#endif
+-	obj = drm_gem_prime_import(dev, dma_buf);
+-	if (IS_ERR(obj))
+-		return obj;
+-
+-	mtk_gem = to_mtk_gem_obj(obj);
+-#if defined(CONFIG_MTK_IOMMU_V2)
+-	mtk_gem->handle = handle;
+-
+-	DDPDBG("%s:%d client:0x%p, handle=0x%p obj:0x%p, gem:0x%p -\n",
+-		   __func__, __LINE__,
+-		   client,
+-		   handle,
+-		   obj,
+-		   mtk_gem);
+-#endif
+-
+-	return obj;
+-}
+ 
+ /*
+  * Allocate a sg_table for this GEM object.
+--- a/drivers/gpu/drm/mediatek/mtk_drm_gem.h
++++ b/drivers/gpu/drm/mediatek/mtk_drm_gem.h
+@@ -45,11 +45,7 @@
+ 	size_t size;
+ 	unsigned long dma_attrs;
+ 	struct sg_table *sg;
+-#if defined(CONFIG_MTK_IOMMU_V2)
+-	struct ion_handle *handle;
+-#endif
+ 	bool sec;
+-	bool is_dumb;
+ 	int sec_id;
+ };
+ 
+@@ -74,8 +70,6 @@
+ struct ion_handle *mtk_drm_gem_ion_import_handle(struct ion_client *client,
+ 	int fd);
+ #endif
+-struct drm_gem_object *
+-mtk_gem_prime_import(struct drm_device *dev, struct dma_buf *dma_buf);
+ struct sg_table *mtk_gem_prime_get_sg_table(struct drm_gem_object *obj);
+ struct drm_gem_object *
+ mtk_gem_prime_import_sg_table(struct drm_device *dev,

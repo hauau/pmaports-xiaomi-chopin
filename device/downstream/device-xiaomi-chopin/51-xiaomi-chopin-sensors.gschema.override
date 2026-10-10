@@ -1,0 +1,4 @@
+# Phosh's own override disables auto brightness for the Phosh desktop
+# ([...:Phosh] section); the chopin ALS works, so re-enable it there.
+[org.gnome.settings-daemon.plugins.power:Phosh]
+ambient-enabled=true

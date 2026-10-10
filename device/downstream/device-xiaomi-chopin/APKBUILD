@@ -1,0 +1,179 @@
+# Reference: <https://postmarketos.org/devicepkg>
+maintainer="Sergei Shikalov <ssh@42px.org>"
+pkgname=device-xiaomi-chopin
+pkgver=1
+pkgrel=42
+pkgdesc="Redmi Note 10 Pro 5G / POCO X3 GT"
+url="https://postmarketos.org"
+arch="aarch64"
+license="MIT"
+depends="
+	android-tools-avbtool
+	android-tools-mkbootimg
+	alsa-ucm-conf
+	alsa-utils
+	bluez-btmgmt
+	bubblewrap
+	device-mapper
+	geoclue
+	iio-sensor-proxy>=3.9-r3
+	iio-sensor-proxy-openrc>=3.9-r3
+	iio-sensor-proxy-udev>=3.9-r3
+	linux-xiaomi-chopin>=4.14.336-r26
+	mesa-panfork-chopin>=23.0.0_git20240119-r12
+	mount
+	firmware-xiaomi-chopin>=20240528-r2
+	postmarketos-base
+	phoc>=0.57.0-r3
+	pipewire>=1.6.9-r1
+	polkit-elogind>=127-r4
+	polkit-openrc>=127-r4
+	util-linux-misc
+	"
+makedepends_build="devicepkg-dev"
+makedepends_host="linux-headers musl-dev"
+install="$pkgname.pre-install $pkgname.pre-upgrade $pkgname.post-install $pkgname.post-upgrade"
+replaces="iwd-openrc"
+replaces_priority=100
+source="
+	deviceinfo
+	xiaomi-chopin-bootimg.sh
+	xiaomi-chopin-wifi.c
+	xiaomi-chopin-wifi.initd
+	xiaomi-chopin-bluetooth.initd
+	xiaomi-chopin-iwd.conf
+	xiaomi-chopin-graphics.sh
+	xiaomi-chopin-video.sh
+	phoc.ini
+	xiaomi-chopin-charging.c
+	xiaomi-chopin-charging.initd
+	xiaomi-chopin-charging.conf
+	xiaomi-chopin-audio.initd
+	xiaomi-chopin-power.initd
+	xiaomi-chopin-power.sleep
+	xiaomi-chopin-suspend.conf
+	51-xiaomi-chopin-sensors.gschema.override
+	xiaomi-chopin-sensors.c
+	xiaomi-chopin-sensors.initd
+	ucm/chopin.conf
+	ucm/HiFi.conf
+	51-xiaomi-chopin-audio.conf
+	xiaomi-chopin-android.c
+	xiaomi-chopin-android-run
+	xiaomi-chopin-stock.initd
+	xiaomi-chopin-vpud.initd
+	xiaomi-chopin-dnsproxyd.initd
+	xiaomi-chopin-mnld.initd
+	xiaomi-chopin-gnss.c
+	xiaomi-chopin-gnss.initd
+	60-xiaomi-chopin-android.rules
+	90-xiaomi-chopin-gnss.conf
+	"
+options="!archcheck !check pmb:cross-native2"
+
+build() {
+	devicepkg_build $startdir $pkgname
+	${CC:-gcc} $CFLAGS -Wall -Wextra -Werror -o xiaomi-chopin-wifi \
+		"$srcdir/xiaomi-chopin-wifi.c" $LDFLAGS
+	${CC:-gcc} $CFLAGS -Wall -Wextra -Werror -o xiaomi-chopin-charging \
+		"$srcdir/xiaomi-chopin-charging.c" $LDFLAGS
+	${CC:-gcc} $CFLAGS -Wall -Wextra -Werror -o xiaomi-chopin-sensors \
+		"$srcdir/xiaomi-chopin-sensors.c" $LDFLAGS
+	${CC:-gcc} $CFLAGS -Wall -Wextra -Werror -o xiaomi-chopin-android \
+		"$srcdir/xiaomi-chopin-android.c" $LDFLAGS
+	${CC:-gcc} $CFLAGS -Wall -Wextra -Werror -o xiaomi-chopin-gnss \
+		"$srcdir/xiaomi-chopin-gnss.c" $LDFLAGS
+}
+
+package() {
+	devicepkg_package $startdir $pkgname
+	install -Dm755 "$srcdir/xiaomi-chopin-bootimg.sh" \
+		"$pkgdir/usr/share/mkinitfs/xiaomi-chopin-bootimg.sh"
+	install -Dm755 xiaomi-chopin-wifi "$pkgdir/usr/libexec/xiaomi-chopin-wifi"
+	install -Dm755 "$srcdir/xiaomi-chopin-wifi.initd" \
+		"$pkgdir/etc/init.d/xiaomi-chopin-wifi"
+	install -Dm755 "$srcdir/xiaomi-chopin-bluetooth.initd" \
+		"$pkgdir/etc/init.d/xiaomi-chopin-bluetooth"
+	install -Dm644 "$srcdir/xiaomi-chopin-iwd.conf" "$pkgdir/etc/conf.d/iwd"
+	install -Dm644 "$srcdir/xiaomi-chopin-graphics.sh" \
+		"$pkgdir/etc/profile.d/25xiaomi-chopin-graphics.sh"
+	install -Dm644 "$srcdir/xiaomi-chopin-video.sh" \
+		"$pkgdir/etc/profile.d/25xiaomi-chopin-video.sh"
+	install -Dm644 "$srcdir/phoc.ini" "$pkgdir/etc/phosh/phoc.ini"
+	install -Dm755 xiaomi-chopin-charging \
+		"$pkgdir/usr/libexec/xiaomi-chopin-charging"
+	install -Dm755 "$srcdir/xiaomi-chopin-charging.initd" \
+		"$pkgdir/etc/init.d/xiaomi-chopin-charging"
+	install -Dm644 "$srcdir/xiaomi-chopin-charging.conf" \
+		"$pkgdir/etc/conf.d/xiaomi-chopin-charging"
+	install -Dm755 "$srcdir/xiaomi-chopin-audio.initd" \
+		"$pkgdir/etc/init.d/xiaomi-chopin-audio"
+	install -Dm755 "$srcdir/xiaomi-chopin-power.initd" \
+		"$pkgdir/etc/init.d/xiaomi-chopin-power"
+	install -Dm755 "$srcdir/xiaomi-chopin-power.sleep" \
+		"$pkgdir/usr/libexec/elogind/system-sleep/xiaomi-chopin-power"
+	install -Dm644 "$srcdir/xiaomi-chopin-suspend.conf" \
+		"$pkgdir/usr/lib/elogind/sleep.conf.d/50-xiaomi-chopin.conf"
+	install -Dm644 "$srcdir/51-xiaomi-chopin-sensors.gschema.override" \
+		"$pkgdir/usr/share/glib-2.0/schemas/51-xiaomi-chopin-sensors.gschema.override"
+	install -Dm755 xiaomi-chopin-sensors "$pkgdir/usr/libexec/xiaomi-chopin-sensors"
+	install -Dm755 "$srcdir/xiaomi-chopin-sensors.initd" \
+		"$pkgdir/etc/init.d/xiaomi-chopin-sensors"
+	install -Dm644 "$srcdir/chopin.conf" \
+		"$pkgdir/usr/share/alsa/ucm2/MediaTek/chopin/chopin.conf"
+	install -Dm644 "$srcdir/HiFi.conf" \
+		"$pkgdir/usr/share/alsa/ucm2/MediaTek/chopin/HiFi.conf"
+	mkdir -p "$pkgdir/usr/share/alsa/ucm2/conf.d/mt6885-mt6359"
+	ln -s ../../MediaTek/chopin/chopin.conf \
+		"$pkgdir/usr/share/alsa/ucm2/conf.d/mt6885-mt6359/mt6885-mt6359.conf"
+	install -Dm644 "$srcdir/51-xiaomi-chopin-audio.conf" \
+		"$pkgdir/usr/share/wireplumber/wireplumber.conf.d/51-xiaomi-chopin-audio.conf"
+	install -Dm755 xiaomi-chopin-android "$pkgdir/usr/libexec/xiaomi-chopin-android"
+	install -Dm755 "$srcdir/xiaomi-chopin-android-run" \
+		"$pkgdir/usr/libexec/xiaomi-chopin-android-run"
+	install -Dm755 xiaomi-chopin-gnss "$pkgdir/usr/libexec/xiaomi-chopin-gnss"
+	local service
+	for service in stock vpud dnsproxyd mnld gnss; do
+		install -Dm755 "$srcdir/xiaomi-chopin-$service.initd" \
+			"$pkgdir/etc/init.d/xiaomi-chopin-$service"
+	done
+	install -Dm644 "$srcdir/60-xiaomi-chopin-android.rules" \
+		"$pkgdir/usr/lib/udev/rules.d/60-xiaomi-chopin-android.rules"
+	install -Dm644 "$srcdir/90-xiaomi-chopin-gnss.conf" \
+		"$pkgdir/etc/geoclue/conf.d/90-xiaomi-chopin-gnss.conf"
+}
+
+sha512sums="
+e6ea56b06233225821775fd34adec9eb3586d5302395cbbb0f75c87809ca91a27c47225f7cf0697445f26dba6d2ec3fe1a801b56e5531d91f1b2e8cbe6900735  deviceinfo
+ae6db01cf0da3df5f8e5c0bd19e14167fa937bbee49f74b6fb1b949e297ebed662b54975e36d4b2d57f60173efbb278c0936c1539152555352a1b6cdde5d18af  xiaomi-chopin-bootimg.sh
+519246031a918776d24a9dd1aa2727575f3b93ff5d59688145d65b3a281128fd2b01744ed8765354eceb5c1d39091f15716b5ce6ba95b8f00cfb721c7e01174f  xiaomi-chopin-wifi.c
+4ed697098d2da4c4b0f573e27dad9551b1664af90d1ed9c0c6351c5306258cf4062fe8dbd871d5da9540043116e41c6d3b230fa2241017f5e1a04cfb28ca29da  xiaomi-chopin-wifi.initd
+0b39d9f0cdd90e494672f84f71b5f14ba3a5683c792b513a8e9a8a87ab1f4169c5c1166b93debcf9ea955070835a6f7961d2747f4d4fb8f69269896986865657  xiaomi-chopin-bluetooth.initd
+c6e59c939988e7b5690afb456d6c61a5b3208d2226b79926d458ce644abbda9866422608ebbd5f161fa657b3b85136fe78cfbafb8889ef04ff8d25f6bbcba2fd  xiaomi-chopin-iwd.conf
+0cb5ffde2c0e2810ee1711b2de185a1ca29fbe43bfa3c0daac4aa461a7794ebb22c72a94cfeee636682bab5533c985297badf367dcf246b91e78fea197e7ddbb  xiaomi-chopin-graphics.sh
+0f9f387d3572cc96f10b272a94e19c5be7bc28abd3f2cdb4bee221d3ab67725068c093d7987dda869244a022da3d64b09eee77da33cf68d02a6b1882b1c0c283  xiaomi-chopin-video.sh
+61b1e292aa764cbd716fc88ba535079bfa4029bcd63f169f1b222d2d69fe81185b80398541caa1d5ead08bd39f717c92644d1439f42482754f92155b1eead04a  phoc.ini
+3b5eca65f3ea039cd99c881dc17b32903392aac32fcdc978d2d1fb65ccccdd7df22ff20932afa204b0d6cd3da88d3f36342996a00c3719ed3ce44ea433030624  xiaomi-chopin-charging.c
+391bb6a3e1067bbee2b4695515714f5bcafed289f8a93093caabb8040746d5875984c0ebc115ca2339fed3b1b8550609b000b9b31881c7de71fc7343e0b750de  xiaomi-chopin-charging.initd
+bd0e099a2f9075c5b8798b39f7053c8347d5147861758c61a209fc2e5ee1298baae6cbe21ff480d2bd5112954b8771a0ee62dac74a256d692c1e97dc8c5d43fb  xiaomi-chopin-charging.conf
+6ca723732886d1161ccf1bae5f77dd1c8cf6afbd0175674d6f7493c3c13a8ca1fae1d92d4b2080cd354bcf0a224ae3a70594dd996954f25d28f4a16a6e1694c4  xiaomi-chopin-audio.initd
+c18987c35b8d87983704cd2f9f51ea92573e5450ebf3ecb64c0cd341f855f6bc66b49d45cd1952bafb0637183fa78f242d182ed08bf90e1622e2e1f8c6a5b42d  xiaomi-chopin-power.initd
+5e8da9ea164ebe2f1d831e3871d1f39ee915b099e3249192d6bb435b95a87b8391d734a88b08c24a20d5c7b793dbec248e88a1db22f9496f16308e4c001f81d8  xiaomi-chopin-power.sleep
+237ac5c62e3f3ece7ce40e906ea4884a15ba6293903770b2b4f82394b38552431576dc9294a74d8bf0b156fdeba6f7534b21a93f8a284c50aa973ff4ee433ade  xiaomi-chopin-suspend.conf
+c122c177aff6a8a54b2d9a36984c2133b795f8e911d1bfde6e96533dc274e7e5c9f16d6858d8c290bd78ae100c3d4de4ca76890e06139af49126c5149e781af8  51-xiaomi-chopin-sensors.gschema.override
+998b915fe516cb5db4809b87cd28e337ce9da0f40f9261feb97d019b0804ca4f446522b8662c7cc7cda28ece59ea7b996d05ac0a61083700c33c2302c9a1853e  xiaomi-chopin-sensors.c
+3351170ca58da934454e11979ab106e3add9c8bcdf36b620095be4117339c850915d58721d188fd744b49bbc18d1cfab6f41115ad714a07377d8a072e5aa1b1f  xiaomi-chopin-sensors.initd
+492fafd90d7502e86685f0fe10d984143fd0e472758f674feed485557cefeb0e3efd81539531f4747cf46a62241266a4db53a7fa6439c5712ddb558ecdf3e8b0  chopin.conf
+df41e5b1f8c2a63bf2fe8b88a52778ea6738b2f64a2f7a64d265943e250c3e04f469e4bfd25b6d74c81defda8b20c819b2df66a15054069efc860455e7dc29f2  HiFi.conf
+4c8d7b2ca791dd8a306403e17921bbf494da3f787f44a753aafa3511bbfd85d6694bb4843f5177b5a0aa1852e528d286931a01d85fe61884e1920bd8ba396a1f  51-xiaomi-chopin-audio.conf
+504800e1e6327b07fb124009275fb4e185cd6c4d8a37ef704e1cac012d9132ec06f5f72e152566d75ab05e2a6316d02aa5103abdb650b894688b5c7c0d2cb056  xiaomi-chopin-android.c
+9381bbf165ed3e8630f020b91439577855345b541711277d5190617b041eb18f50311ab986566ab6ca65e370dfdbe09c568b707979f866b268a8f5e9800c709a  xiaomi-chopin-android-run
+9b17343458221741585c5d7f4635dace13d1de0c0f9fea45ed470fdc5294e7ff0232fda2a6fdf8777a26c06538ec8a4217e9626fa27bf6374cee21b4082a9b0d  xiaomi-chopin-stock.initd
+5d656ebaaa6d9c4b35a631e0952d9031c246dbfdda4572bcd3a1e17376ff865b01d4b6692563de30d94e73691439bc99563c22c7096a21aa8d3699144170ac5c  xiaomi-chopin-vpud.initd
+f1f90271f14b6c309ac3190966dee13e14a42442cd7ccff4127a6a1b5662a2294ff05c4e9deef5671e0ef48c3cb5484abcfed89bad946f2417eaa803e13cb498  xiaomi-chopin-dnsproxyd.initd
+0421d7f5ed5ce8cffe0567dd61d82b6424e35455377417ad67be3b4160a76be0a9ec7441c754f579866f11573cfb108601a4d70ed2bd50f208dcab65290dac65  xiaomi-chopin-mnld.initd
+9df8faa88a182d9ed3b58eefdf4ca5bfff9d37b906a5c24b96915a9425c39e093d7edd788297e547b136df5df12d132628905294a0a1f58793f673025dd1865b  xiaomi-chopin-gnss.c
+e293534b1b576bbe0b90561e28395db8864eb2ce065b90af9a3b8d87f02c2f389aa36957c469f798c24bc1a0116ebacc0aa71656ac72b8d5af15f8274a28475c  xiaomi-chopin-gnss.initd
+e5e510a1e0082bcb5d5f26112a40e95e9198bd3f580822432b70e16f5ebb4f1e6911445de21485dee9f015f50a1d8234b60d984a318ffd1e74b1af125da79d04  60-xiaomi-chopin-android.rules
+e40f85bbe7ecaff889a7750cbc5ad43452bdc0b68441ef02fff012aaf34288c7ba77f567b7d8828e53784a83f6bebf3a2f669190f607f5fae0d9f7db62992bf9  90-xiaomi-chopin-gnss.conf
+"

@@ -1,0 +1,34 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Calibrated MediaTek Wi-Fi startup for Xiaomi chopin"
+
+depend() {
+	need udev
+	after localmount
+	before networkmanager iwd
+}
+
+start() {
+	local nvdata=/run/xiaomi-chopin-wifi
+	local result
+
+	ebegin "Starting Xiaomi chopin Wi-Fi"
+	checkpath --directory --mode 0700 "$nvdata" || { eend 1; return 1; }
+	if ! mount -t ext4 -o ro,noload /dev/disk/by-partlabel/nvdata "$nvdata"; then
+		rmdir "$nvdata"
+		eend 1
+		return 1
+	fi
+	/usr/libexec/xiaomi-chopin-wifi "$nvdata/APCFG/APRDEB/WIFI"
+	result=$?
+	umount "$nvdata" || result=1
+	rmdir "$nvdata" || result=1
+	eend "$result"
+}
+
+stop() {
+	ebegin "Stopping Xiaomi chopin Wi-Fi"
+	printf '%s' 0 > /dev/wmtWifi
+	eend $?
+}

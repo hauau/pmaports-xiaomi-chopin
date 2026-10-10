@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Android DNS proxy for the stock Xiaomi chopin vendor daemons"
+
+supervisor=supervise-daemon
+command=/usr/libexec/xiaomi-chopin-android
+command_args="dnsproxyd /run/xiaomi-chopin-android/socket/dnsproxyd"
+command_user=nobody:nobody
+
+depend() {
+	after net
+}
+
+start_pre() {
+	checkpath --directory --mode 0755 /run/xiaomi-chopin-android &&
+		checkpath --directory --mode 0755 --owner nobody:nobody /run/xiaomi-chopin-android/socket
+}

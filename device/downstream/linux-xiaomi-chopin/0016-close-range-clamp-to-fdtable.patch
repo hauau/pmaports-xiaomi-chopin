@@ -1,0 +1,25 @@
+close_range: clamp the closed range to the descriptor table.
+
+The backported __close_range() kept the 6.x punch_hole/dup_fd structure
+but lost upstream's clamp of max_fd to the fdtable. close_range(3, ~0U, 0),
+used by systemd/elogind safe_fork(), then calls pick_file() for ~2^31
+descriptors and spins for about 30 seconds in the kernel, delaying every
+elogind fork (backlight SetBrightness, sleep). Clamp as upstream does.
+
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -705,6 +705,14 @@
+ static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,
+ 				 unsigned int max_fd)
+ {
++	unsigned int n;
++
++	/* Like upstream, never walk past the descriptor table. */
++	rcu_read_lock();
++	n = last_fd(files_fdtable(cur_fds));
++	rcu_read_unlock();
++	max_fd = min(max_fd, n);
++
+ 	while (fd <= max_fd) {
+ 		struct file *file;
+ 

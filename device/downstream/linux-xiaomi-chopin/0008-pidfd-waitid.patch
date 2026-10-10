@@ -1,0 +1,132 @@
+From: Nura maintainers <nura@localhost>
+Subject: [PATCH] pidfd: complete the existing backport with waitid support
+
+The downstream kernel already exposes pidfd_open and pidfd polling, but
+waitid rejects P_PIDFD. GLib consequently cannot reap GUI session children
+through the descriptor it successfully opened.
+
+Adapt Christian Brauner's upstream P_PIDFD implementation to this tree.
+Keep the descriptor referenced while do_wait uses its struct pid; preserve
+legacy PID/group waiting and reuse the descriptor conversion for signals.
+
+Upstream: https://lwn.net/ml/linux-kernel/20190726093934.13557-2-christian@brauner.io/
+
+diff --git a/include/linux/pid.h b/include/linux/pid.h
+--- a/include/linux/pid.h
++++ b/include/linux/pid.h
+@@ -72,7 +72,11 @@
+ extern struct pid init_struct_pid;
+ 
+ extern const struct file_operations pidfd_fops;
+ 
++struct file;
++
++extern struct pid *pidfd_pid(const struct file *file);
++
+ static inline struct pid *get_pid(struct pid *pid)
+ {
+ 	if (pid)
+diff --git a/include/uapi/linux/wait.h b/include/uapi/linux/wait.h
+--- a/include/uapi/linux/wait.h
++++ b/include/uapi/linux/wait.h
+@@ -17,6 +17,7 @@
+ #define P_ALL		0
+ #define P_PID		1
+ #define P_PGID		2
++#define P_PIDFD		3
+ 
+ 
+ #endif /* _UAPI_LINUX_WAIT_H */
+diff --git a/kernel/exit.c b/kernel/exit.c
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -1618,6 +1618,7 @@
+ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
+ 			  int options, struct rusage *ru)
+ {
++	struct fd f;
+ 	struct wait_opts wo;
+ 	struct pid *pid = NULL;
+ 	enum pid_type type;
+@@ -1637,19 +1638,31 @@
+ 		type = PIDTYPE_PID;
+ 		if (upid <= 0)
+ 			return -EINVAL;
++		pid = find_get_pid(upid);
+ 		break;
+ 	case P_PGID:
+ 		type = PIDTYPE_PGID;
+ 		if (upid <= 0)
+ 			return -EINVAL;
++		pid = find_get_pid(upid);
++		break;
++	case P_PIDFD:
++		type = PIDTYPE_PID;
++		if (upid < 0)
++			return -EINVAL;
++		f = fdget(upid);
++		if (!f.file)
++			return -EBADF;
++		pid = pidfd_pid(f.file);
++		if (IS_ERR(pid)) {
++			fdput(f);
++			return PTR_ERR(pid);
++		}
+ 		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 
+-	if (type < PIDTYPE_MAX)
+-		pid = find_get_pid(upid);
+-
+ 	wo.wo_type	= type;
+ 	wo.wo_pid	= pid;
+ 	wo.wo_flags	= options;
+@@ -1657,7 +1670,10 @@
+ 	wo.wo_rusage	= ru;
+ 	ret = do_wait(&wo);
+ 
+-	put_pid(pid);
++	if (which == P_PIDFD)
++		fdput(f);
++	else
++		put_pid(pid);
+ 	return ret;
+ }
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1576,6 +1576,14 @@
+ 		task->signal->pids[type] = pid;
+ }
+ 
++struct pid *pidfd_pid(const struct file *file)
++{
++	if (file->f_op == &pidfd_fops)
++		return file->private_data;
++
++	return ERR_PTR(-EINVAL);
++}
++
+ static int pidfd_release(struct inode *inode, struct file *file)
+ {
+ 	struct pid *pid = file->private_data;
+diff --git a/kernel/signal.c b/kernel/signal.c
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -3147,8 +3147,11 @@
+ 
+ static struct pid *pidfd_to_pid(const struct file *file)
+ {
+-	if (file->f_op == &pidfd_fops)
+-		return file->private_data;
++	struct pid *pid;
++
++	pid = pidfd_pid(file);
++	if (!IS_ERR(pid))
++		return pid;
+ 
+ 	return tgid_pidfd_to_pid(file);
+ }

@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Stock sensor-hub calibration for Xiaomi chopin"
+
+nvcfg_device="/dev/disk/by-partlabel/nvcfg"
+nvcfg_mount="/run/xiaomi-chopin-nvcfg"
+
+depend() {
+	need udev
+	after localmount
+	before iio-sensor-proxy
+}
+
+start() {
+	local ret
+
+	ebegin "Loading stock ambient-light calibration into the Xiaomi chopin sensor hub"
+	mkdir -p "$nvcfg_mount" || { eend 1; return 1; }
+	# Android's calibration partition: read-only, without journal replay.
+	mount -t ext4 -o ro,noload "$nvcfg_device" "$nvcfg_mount" || {
+		rmdir "$nvcfg_mount"
+		eend 1
+		return 1
+	}
+	/usr/libexec/xiaomi-chopin-sensors "$nvcfg_mount/sensor/als_cali.json"
+	ret=$?
+	umount "$nvcfg_mount"
+	rmdir "$nvcfg_mount"
+	eend $ret
+}

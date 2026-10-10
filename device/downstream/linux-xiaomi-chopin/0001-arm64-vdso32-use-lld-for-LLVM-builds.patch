@@ -1,0 +1,21 @@
+Use the LLVM linker for the compat vDSO when building with LLVM.
+
+The vendor Makefile probes GNU BFD even in an LLVM build. Without an ARM32
+GNU toolchain, clang falls back to the host x86 linker and fails with
+"unrecognised emulation mode: armelf_linux_eabi". Keep the GNU path for
+non-LLVM builds rather than disabling CONFIG_COMPAT_VDSO.
+
+--- a/arch/arm64/kernel/vdso32/Makefile
++++ b/arch/arm64/kernel/vdso32/Makefile
+@@ -97,7 +97,11 @@
+ VDSO_LDFLAGS += -nostdlib -shared -mfloat-abi=soft
+ VDSO_LDFLAGS += $(call cc32-ldoption,-Wl$(comma)--hash-style=sysv)
+ VDSO_LDFLAGS += $(call cc32-ldoption,-Wl$(comma)--build-id)
++ifneq ($(LLVM),)
++VDSO_LDFLAGS += -fuse-ld=lld
++else
+ VDSO_LDFLAGS += $(call cc32-ldoption,-fuse-ld=bfd)
++endif
+ 
+ 
+ # Borrow vdsomunge.c from the arm vDSO

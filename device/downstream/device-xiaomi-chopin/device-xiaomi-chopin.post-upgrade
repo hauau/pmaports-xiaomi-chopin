@@ -1,0 +1,10 @@
+#!/bin/sh
+rc-update add xiaomi-chopin-wifi default
+rc-update add xiaomi-chopin-charging default
+rc-update add xiaomi-chopin-audio default
+rc-update add xiaomi-chopin-bluetooth default
+rc-update add xiaomi-chopin-power default
+rc-update add iio-sensor-proxy default
+rc-update add xiaomi-chopin-sensors default
+rc-update add xiaomi-chopin-vpud default
+rc-update add xiaomi-chopin-mnld default

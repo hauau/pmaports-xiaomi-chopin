@@ -1,0 +1,70 @@
+mali: resolve kbase task pids in the initial pid namespace.
+
+kbase stores current->tgid, a pid in the initial pid namespace, and then
+resolved it with find_get_pid(), which looks the number up in the caller's
+pid namespace. Inside a pid namespace the lookup failed, context creation
+returned -ESRCH and userspace saw KBASE_IOCTL_SET_FLAGS fail with ENOMEM:
+no GPU access for any sandboxed process, which made WebKitGTK's web
+process abort. Use the caller's thread group leader directly, and look up
+the stored pid in the initial namespace in the OOM notifier.
+
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/context/mali_kbase_context.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/context/mali_kbase_context.c
+@@ -192,37 +192,14 @@
+ 
+ 	/* Check if this is a Userspace created context */
+ 	if (likely(kctx->filp)) {
+-		struct pid *pid_struct;
+-
+-		rcu_read_lock();
+-		pid_struct = find_get_pid(kctx->tgid);
+-		if (likely(pid_struct)) {
+-			struct task_struct *task = pid_task(pid_struct, PIDTYPE_PID);
+-
+-			if (likely(task)) {
+-				/* Take a reference on the task to avoid slow lookup
+-				 * later on from the page allocation loop.
+-				 */
+-				get_task_struct(task);
+-				kctx->task = task;
+-			} else {
+-				dev_err(kctx->kbdev->dev,
+-					"Failed to get task pointer for %s/%d",
+-					current->comm, current->pid);
+-				err = -ESRCH;
+-			}
+-
+-			put_pid(pid_struct);
+-		} else {
+-			dev_err(kctx->kbdev->dev,
+-				"Failed to get pid pointer for %s/%d",
+-				current->comm, current->pid);
+-			err = -ESRCH;
+-		}
+-		rcu_read_unlock();
+-
+-		if (unlikely(err))
+-			return err;
++		/* Take a reference on the task to avoid slow lookup later on
++		 * from the page allocation loop. kctx->tgid is the thread group
++		 * leader's pid in the initial pid namespace; looking it up with
++		 * find_get_pid() resolved it in the caller's namespace instead
++		 * and failed for every sandboxed process (bubblewrap, WebKit).
++		 */
++		get_task_struct(current->group_leader);
++		kctx->task = current->group_leader;
+ 	}
+ 
+ 	/* Check if this is a Userspace created context */
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/device/mali_kbase_device.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/device/mali_kbase_device.c
+@@ -194,7 +194,8 @@
+ 			KBASE_PAGES_TO_KIB(atomic_read(&(kctx->used_pages)));
+ 
+ 		rcu_read_lock();
+-		pid_struct = find_get_pid(kctx->pid);
++		/* kctx->pid is a pid in the initial pid namespace. */
++		pid_struct = get_pid(find_pid_ns(kctx->pid, &init_pid_ns));
+ 		task = pid_task(pid_struct, PIDTYPE_PID);
+ 
+ 		dev_err(kbdev->dev,

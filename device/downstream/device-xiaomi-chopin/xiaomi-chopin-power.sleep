@@ -1,0 +1,21 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: MIT
+# The native MTU3 gadget holds musb-hdrc awake while USB data is connected.
+# Charge-only mode releases that wake lock without disconnecting USB power.
+# Restore the caller's actual mode after resume, including charge-only mode.
+cmode=/sys/devices/platform/11201000.mtu3_0/cmode
+saved=/run/xiaomi-chopin-power-usb-mode
+
+case "$1" in
+	pre)
+		umask 077
+		cat "$cmode" > "$saved" || exit 1
+		printf '0\n' > "$cmode"
+		;;
+	post)
+		[ -f "$saved" ] || exit 0
+		cat "$saved" > "$cmode" || exit 1
+		rm "$saved"
+		;;
+esac

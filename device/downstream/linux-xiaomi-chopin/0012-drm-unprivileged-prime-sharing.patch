@@ -1,0 +1,26 @@
+Subject: [PATCH] drm: remove authentication from PRIME buffer sharing
+
+Backport the permission change from upstream commit
+30a958526d2cc6df38347336a602479d048d92e7 (drm: remove the DRM_AUTH requirement
+from PRIME ioctls):
+https://git.zx2c4.com/wireguard-linux/commit/?id=30a958526d2cc6df38347336a602479d048d92e7
+
+Native Wayland applications reopen the primary node because this downstream
+display driver has no render node. PRIME still checks the caller's own GEM
+handle or owned DMA-BUF descriptor; sharing those buffers needs neither
+DRM-master status nor access to another client's handles. Keep the 4.14
+DRM_UNLOCKED flag and leave modesetting authentication unchanged.
+
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -623,8 +623,8 @@
+ 
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETRESOURCES, drm_mode_getresources, DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 
+-	DRM_IOCTL_DEF(DRM_IOCTL_PRIME_HANDLE_TO_FD, drm_prime_handle_to_fd_ioctl, DRM_AUTH|DRM_UNLOCKED|DRM_RENDER_ALLOW),
+-	DRM_IOCTL_DEF(DRM_IOCTL_PRIME_FD_TO_HANDLE, drm_prime_fd_to_handle_ioctl, DRM_AUTH|DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF(DRM_IOCTL_PRIME_HANDLE_TO_FD, drm_prime_handle_to_fd_ioctl, DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF(DRM_IOCTL_PRIME_FD_TO_HANDLE, drm_prime_fd_to_handle_ioctl, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ 
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETPLANERESOURCES, drm_mode_getplane_res, DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETCRTC, drm_mode_getcrtc, DRM_CONTROL_ALLOW|DRM_UNLOCKED),

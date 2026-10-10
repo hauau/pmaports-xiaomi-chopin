@@ -1,0 +1,44 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Factory Bluetooth address startup for Xiaomi chopin"
+
+depend() {
+	need udev xiaomi-chopin-wifi
+	after localmount
+	before bluetooth greetd
+}
+
+load_address() {
+	local file=$1
+	local bytes address
+
+	[ "$(wc -c < "$file")" -eq 440 ] || return 1
+	bytes=$(od -An -v -N6 -tx1 "$file") || return 1
+	set -- $bytes
+	[ "$#" -eq 6 ] || return 1
+	case "$1" in ?[13579bdf]) return 1 ;; esac
+	address=$(printf '%s:%s:%s:%s:%s:%s' "$@") || return 1
+	case "$address" in
+		00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) return 1 ;;
+	esac
+	timeout 10 btmgmt --index 0 public-addr "$address"
+}
+
+start() {
+	local nvdata=/run/xiaomi-chopin-bluetooth
+	local result
+
+	ebegin "Loading Xiaomi chopin factory Bluetooth address"
+	checkpath --directory --mode 0700 "$nvdata" || { eend 1; return 1; }
+	if ! mount -t ext4 -o ro,noload /dev/disk/by-partlabel/nvdata "$nvdata"; then
+		rmdir "$nvdata"
+		eend 1
+		return 1
+	fi
+	load_address "$nvdata/APCFG/APRDEB/BT_Addr"
+	result=$?
+	umount "$nvdata" || result=1
+	rmdir "$nvdata" || result=1
+	eend "$result"
+}

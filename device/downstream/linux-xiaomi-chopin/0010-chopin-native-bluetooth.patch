@@ -1,0 +1,203 @@
+From: Nura chopin port
+Subject: [PATCH] Bluetooth: expose the MediaTek BTIF transport to the native HCI stack
+
+The SoC driver already has an HCI transport, but its Android configuration
+publishes only /dev/stpbt. Bind the native interface to the existing BlueZ
+Kconfig option and retain HCI_SETUP so Linux initializes the controller.
+Register only after transport state, power management, calibration callbacks
+and firmware names are ready; hci_register_dev schedules setup immediately.
+The firmware reports a shared default BD_ADDR; require the factory public
+address through native management configuration and restore it after power loss.
+Only query Synchronization Train parameters when the command bitmap supports it,
+not solely because the firmware's LMP feature page advertises the feature.
+
+--- a/drivers/misc/mediatek/connectivity/bt/mt66xx/btif/Makefile
++++ b/drivers/misc/mediatek/connectivity/bt/mt66xx/btif/Makefile
+@@ -34,6 +34,6 @@ ccflags-y += -D CHIP_IF_BTIF
+ 
+ # Use device node or hci_dev as native interface
+-ccflags-y += -D USE_DEVICE_NODE=1
++ccflags-y += -D USE_DEVICE_NODE=$(if $(CONFIG_MTK_COMBO_BT_HCI),0,1)
+ 
+ # Customized fw update feature
+ ccflags-y += -D CUSTOMER_FW_UPDATE=0
+--- a/drivers/misc/mediatek/connectivity/bt/mt66xx/include/btmtk_chip_if.h
++++ b/drivers/misc/mediatek/connectivity/bt/mt66xx/include/btmtk_chip_if.h
+@@ -16,7 +16,7 @@
+ #include "btmtk_btif.h"
+ #define CFG_SUPPORT_BT_DL_WIFI_PATCH    0
+ #define CFG_SUPPORT_DVT                 0
+-#define CFG_SUPPORT_BLUEZ               0
++#define CFG_SUPPORT_BLUEZ               (USE_DEVICE_NODE == 0)
+ 
+ #if (CONNAC20_CHIPID == 6885)
+ 	#include "platform_mt6885.h"
+--- a/drivers/misc/mediatek/connectivity/bt/mt66xx/btmtk_main.c
++++ b/drivers/misc/mediatek/connectivity/bt/mt66xx/btmtk_main.c
+@@ -3496,6 +3496,30 @@
+ 	return 0;
+ }
+ 
++#if defined(CHIP_IF_BTIF) && CFG_SUPPORT_BLUEZ
++static int bt_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
++{
++	struct sk_buff *skb;
++
++	skb = __hci_cmd_sync(hdev, 0xfc1a, sizeof(*bdaddr), bdaddr,
++			     HCI_INIT_TIMEOUT);
++	if (IS_ERR(skb))
++		return PTR_ERR(skb);
++	kfree_skb(skb);
++	bacpy(&hdev->bdaddr, bdaddr);
++	return 0;
++}
++
++static int bt_post_init(struct hci_dev *hdev)
++{
++	if (!bacmp(&hdev->public_addr, BDADDR_ANY))
++		return -EADDRNOTAVAIL;
++	if (!bacmp(&hdev->bdaddr, &hdev->public_addr))
++		return 0;
++	return bt_set_bdaddr(hdev, &hdev->public_addr);
++}
++#endif
++
+ static int bt_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
+ {
+ 	int ret = -1;
+@@ -3726,6 +3750,11 @@
+ 	hdev->flush    = bt_flush;
+ 	hdev->send	   = bt_send_frame;
+ 	hdev->setup    = bt_setup;
++#if defined(CHIP_IF_BTIF) && CFG_SUPPORT_BLUEZ
++	hdev->set_bdaddr = bt_set_bdaddr;
++	hdev->post_init = bt_post_init;
++	set_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks);
++#endif
+ 
+ 	init_waitqueue_head(&bdev->p_wait_event_q);
+ 
+@@ -3745,7 +3774,7 @@
+ 
+ err0:
+ 	hci_free_dev(hdev);
+-	hdev = NULL;
++	bdev->hdev = NULL;
+ end:
+ 	return err;
+ }
+@@ -3754,7 +3783,9 @@ int btmtk_register_hci_device(struct btmtk_dev *bdev)
+ {
+ 	struct hci_dev *hdev;
+ 	int err = 0;
++#if !CFG_SUPPORT_BLUEZ
+ 	int ret = 0;
++#endif
+ 
+ 	hdev = bdev->hdev;
+ 
+@@ -3791,7 +3822,8 @@ int btmtk_deregister_hci_device(struct btmtk_dev *bdev)
+ {
+ 	int err = 0;
+ 
+-	if (bdev && bdev->hdev)
++	if (bdev && bdev->hdev &&
++	    device_is_registered(&bdev->hdev->dev))
+ 		hci_unregister_dev(bdev->hdev);
+ 
+ 	return err;
+--- a/drivers/misc/mediatek/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
++++ b/drivers/misc/mediatek/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
+@@ -529,7 +529,7 @@
+  *
+  */
+-void bt_report_hw_error()
++void bt_report_hw_error(void)
+ {
+ 	const uint8_t HCI_EVT_HW_ERROR[] = {0x04, 0x10, 0x01, 0x00};
+ 	btmtk_recv(g_sbdev->hdev, HCI_EVT_HW_ERROR, sizeof(HCI_EVT_HW_ERROR));
+ }
+@@ -1520,6 +1520,8 @@
+ 	return btmtk_intcmd_wmt_calibration(bdev->hdev);
+ }
+ 
++static int btmtk_cif_remove(struct platform_device *pdev);
++
+ /* btmtk_cif_probe
+  *
+  *     Probe function of BT driver with BTIF HAL, initialize variable after
+@@ -1534,6 +1536,7 @@
+ static int btmtk_cif_probe(struct platform_device *pdev)
+ {
+ 	struct btmtk_btif_dev *cif_dev = NULL;
++	int ret;
+ 
+ 	/* 1. allocate global context data */
+ 	g_sbdev->cif_dev = &g_btif_dev;
+@@ -1546,11 +1549,11 @@
+ 	}
+ 
+ 	/* 2. Init HCI device */
+-	btmtk_allocate_hci_device(g_sbdev, HCI_UART);
+-#if (USE_DEVICE_NODE == 0)
+-	SET_HCIDEV_DEV(g_sbdev->hdev, BTMTK_GET_DEV(cif_dev));
+-	btmtk_register_hci_device(g_sbdev);
+-#endif
++	ret = btmtk_allocate_hci_device(g_sbdev, HCI_UART);
++	if (ret) {
++		bt_reg_deinit();
++		return ret;
++	}
+ 
+ 	/* 3. Init power manager */
+ 	bt_psm_init(&cif_dev->psm);
+@@ -1605,6 +1608,16 @@
+ 	/* Set ICB cif state */
+ 	btmtk_set_chip_state((void *)g_sbdev, BTMTK_STATE_WORKING);
+ 
++#if (USE_DEVICE_NODE == 0)
++	/* Native HCI setup can open the controller as soon as it is published. */
++	SET_HCIDEV_DEV(g_sbdev->hdev, BTMTK_GET_DEV(cif_dev));
++	ret = btmtk_register_hci_device(g_sbdev);
++	if (ret) {
++		btmtk_cif_remove(pdev);
++		return ret;
++	}
++#endif
++
+ 	BTMTK_INFO("%s: Done", __func__);
+ 	return 0;
+ }
+--- a/drivers/misc/mediatek/connectivity/bt/mt66xx/include/btif/btmtk_btif.h
++++ b/drivers/misc/mediatek/connectivity/bt/mt66xx/include/btif/btmtk_btif.h
+@@ -530,14 +530,14 @@
+ int btmtk_btif_send_cmd(struct btmtk_dev *bdev, struct sk_buff *skb, int delay,
+ 	int retry, int pkt_type);
+ 
++int main_driver_init(void);
++void main_driver_exit(void);
++
+ #if (USE_DEVICE_NODE == 1)
+ uint8_t btmtk_rx_data_valid(void);
+ int32_t btmtk_receive_data(struct hci_dev *hdev, uint8_t *buf, uint32_t count);
+ void btmtk_rx_flush(void);
+ void btmtk_register_rx_event_cb(struct hci_dev *hdev, BT_RX_EVENT_CB cb);
+-int main_driver_init(void);
+-void main_driver_exit(void);
+-
+ void rx_queue_initialize(void);
+ void rx_queue_destroy(void);
+ uint8_t is_rx_queue_empty(void);
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -788,7 +788,8 @@
+-	/* Check for Synchronization Train support */
+-	if (lmp_sync_train_capable(hdev))
++	/* Check the command bitmap as well as the Synchronization Train feature. */
++	if (lmp_sync_train_capable(hdev) &&
++	    (hdev->commands[31] & 0x80))
+ 		hci_req_add(req, HCI_OP_READ_SYNC_TRAIN_PARAMS, 0, NULL);
+ 
+ 	/* Enable Secure Connections if supported and configured */
+ 	if (hci_dev_test_flag(hdev, HCI_SSP_ENABLED) &&
+ 	    bredr_sc_enabled(hdev)) {

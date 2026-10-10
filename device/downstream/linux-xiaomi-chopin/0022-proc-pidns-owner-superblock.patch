@@ -1,0 +1,33 @@
+proc: own the superblock by the pid namespace's user namespace.
+
+proc_mount() looked up the pid namespace's superblock with sget(), which
+uses the caller's user namespace. The kernel mount created when a pid
+namespace gets its first process runs in the forking parent, so when a
+process creates a user and a pid namespace in the same clone() call, as
+bubblewrap does, that superblock belongs to the parent's user namespace
+and the child's own proc mount fails with EBUSY. WebKitGTK's sandbox, and
+with it Epiphany, could not start.
+
+Pass the pid namespace's owner explicitly, as mainline's mount_ns() does.
+The permission check over the pid namespace is unchanged.
+
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -121,7 +121,16 @@
+ 			return ERR_PTR(-EPERM);
+ 	}
+ 
+-	sb = sget(fs_type, proc_test_super, proc_set_super, flags, ns);
++	/*
++	 * Like mainline's mount_ns(), the superblock belongs to the user
++	 * namespace owning the pid namespace. sget() used the caller's: the
++	 * kernel mount made when a pid namespace gets its first process runs
++	 * in the forking parent, so with CLONE_NEWUSER|CLONE_NEWPID in one
++	 * clone() (bubblewrap) the child's own proc mount found that
++	 * superblock owned by another user namespace and failed with EBUSY.
++	 */
++	sb = sget_userns(fs_type, proc_test_super, proc_set_super, flags,
++			 ns->user_ns, ns);
+ 	if (IS_ERR(sb))
+ 		return ERR_CAST(sb);
+ 

@@ -1,0 +1,394 @@
+From: Nura maintainers <nura@localhost>
+Subject: [PATCH] drm/panel: expose K10A native LM36273 backlight
+
+Register one panel-owned raw backlight for the graph-selected K10A panel
+when DT does not provide one. Keep the requested level across blanking
+and restore it only after the panel is prepared and enabled, through the
+native I2C callback so vendor backlight accounting and ESD state agree.
+
+The inherited bootloader state starts enabled, with a conservative
+requested brightness of 600 on the existing 0..2047 scale. The reported
+brightness follows panel power, framebuffer blanking and core suspend.
+
+diff --git a/drivers/gpu/drm/panel/panel-k10a-36-02-0a-dsc-vdo.c b/drivers/gpu/drm/panel/panel-k10a-36-02-0a-dsc-vdo.c
+--- a/drivers/gpu/drm/panel/panel-k10a-36-02-0a-dsc-vdo.c
++++ b/drivers/gpu/drm/panel/panel-k10a-36-02-0a-dsc-vdo.c
+@@ -27,6 +27,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/of_platform.h>
++#include <linux/of_graph.h>
+ #include <linux/platform_device.h>
+ #include <mt-plat/upmu_common.h>
+ #include <linux/double_click.h>
+@@ -549,18 +550,19 @@
+ static int lcm_disable(struct drm_panel *panel)
+ {
+ 	struct lcm *ctx;
++	int ret = 0;
+ 	ctx = panel_to_lcm(panel);
+ 	if (!ctx->enabled)
+ 		return 0;
+ 
++	ctx->enabled = false;
++
+ 	if (ctx->backlight) {
+ 		ctx->backlight->props.power = FB_BLANK_POWERDOWN;
+-		backlight_update_status(ctx->backlight);
+-	}
+-
+-	ctx->enabled = false;
+-
+-	return 0;
++		ret = backlight_update_status(ctx->backlight);
++	}
++
++	return ret;
+ }
+ /*AVDD			-->	VSP  	  --> LM36273_VREG_DISP_P(GPIO126/bias0)*/
+ /*AVEE			-->	VSN		  --> LM36273_VREG_DISP_N(GPIO126/bias0)*/
+@@ -569,11 +571,15 @@
+ static int lcm_unprepare(struct drm_panel *panel)
+ {
+ 	struct lcm *ctx = panel_to_lcm(panel);
++	int ret;
+ 
+ 	pr_info("%s\n", __func__);
+ 
+ 	if (!ctx->prepared)
+ 		return 0;
++
++	ret = lcm_disable(panel);
++	ctx->prepared = false;
+ 
+ 	push_table(ctx, lcm_suspend_setting, sizeof(lcm_suspend_setting) / sizeof(struct LCM_setting_table));
+ 
+@@ -604,7 +610,6 @@
+ 	}
+ 
+ 	ctx->error = 0;
+-	ctx->prepared = false;
+ 	ctx->hbm_en = false;
+ 	panel->panel_initialized = false;
+ 
+@@ -616,7 +621,7 @@
+ 	/* add for display hbm count */
+ 	dsi_panel_HBM_count(ctx, 0, 1);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int lcm_prepare(struct drm_panel *panel)
+@@ -678,16 +683,22 @@
+ static int lcm_enable(struct drm_panel *panel)
+ {
+ 	struct lcm *ctx = panel_to_lcm(panel);
++	int ret;
+ 
+ 	if (ctx->enabled)
+ 		return 0;
+ 
++	ctx->enabled = true;
++
+ 	if (ctx->backlight) {
+ 		ctx->backlight->props.power = FB_BLANK_UNBLANK;
+-		backlight_update_status(ctx->backlight);
+-	}
+-
+-	ctx->enabled = true;
++		ret = backlight_update_status(ctx->backlight);
++		if (ret < 0) {
++			ctx->enabled = false;
++			ctx->backlight->props.power = FB_BLANK_POWERDOWN;
++			return ret;
++		}
++	}
+ 
+ 	return 0;
+ }
+@@ -1266,16 +1277,50 @@
+ static int lcm_setbacklight_i2c(struct drm_panel *panel, unsigned int level)
+ {
+ 	struct lcm *ctx = panel_to_lcm(panel);
++	int ret;
++
++	ret = lm36273_brightness_set(level);
++	if (ret < 0)
++		return ret;
+ 
+ 	bl_tb0[1] = (level >> 8) & 0x7;
+ 	bl_tb0[2] = level & 0xFF;
+-	lm36273_brightness_set(level);
+ 
+ 	/* add for display backlight count */
+ 	dsi_panel_backlight_count(ctx, level);
+ 
+ 	return 0;
+ }
++
++static int lcm_backlight_get_brightness(struct backlight_device *bl)
++{
++	struct lcm *ctx = bl_get_data(bl);
++
++	if (!ctx->prepared || !ctx->enabled ||
++	    bl->props.power != FB_BLANK_UNBLANK ||
++	    bl->props.fb_blank != FB_BLANK_UNBLANK ||
++	    bl->props.state & (BL_CORE_SUSPENDED | BL_CORE_FBBLANK))
++		return 0;
++
++	return bl->props.brightness;
++}
++
++static int lcm_backlight_update_status(struct backlight_device *bl)
++{
++	struct lcm *ctx = bl_get_data(bl);
++
++	if (!ctx->prepared)
++		return 0;
++
++	return lcm_setbacklight_i2c(&ctx->panel,
++				  lcm_backlight_get_brightness(bl));
++}
++
++static const struct backlight_ops lcm_backlight_ops = {
++	.options = BL_CORE_SUSPENDRESUME,
++	.update_status = lcm_backlight_update_status,
++	.get_brightness = lcm_backlight_get_brightness,
++};
+ 
+ static struct drm_display_mode *get_mode_by_id_hfp(struct drm_panel *panel,
+ 	unsigned int mode)
+@@ -1637,7 +1682,19 @@
+ 	struct device *dev = &dsi->dev;
+ 	struct lcm *ctx;
+ 	struct device_node *backlight;
++	struct device_node *endpoint, *remote_node;
+ 	int ret;
++
++	endpoint = of_graph_get_next_endpoint(dsi->host->dev->of_node, NULL);
++	if (!endpoint)
++		return -ENODEV;
++	remote_node = of_graph_get_remote_port_parent(endpoint);
++	of_node_put(endpoint);
++	if (!remote_node || remote_node != dev->of_node) {
++		of_node_put(remote_node);
++		return -ENODEV;
++	}
++	of_node_put(remote_node);
+ 
+ 	pr_info("%s+\n", __func__);
+ 	ctx = devm_kzalloc(dev, sizeof(struct lcm), GFP_KERNEL);
+@@ -1685,6 +1742,20 @@
+ 	ctx->panel_info = panel_name;
+ 	ctx->panel.panel_initialized = true;
+ 
++	if (!ctx->backlight) {
++		struct backlight_properties props = {
++			.type = BACKLIGHT_RAW,
++			.max_brightness = 2047,
++			.brightness = 600,
++			.power = FB_BLANK_UNBLANK,
++		};
++
++		ctx->backlight = devm_backlight_device_register(dev,
++				dev_name(dev), dev, ctx, &lcm_backlight_ops, &props);
++		if (IS_ERR(ctx->backlight))
++			return PTR_ERR(ctx->backlight);
++	}
++
+ 	ret = drm_panel_add(&ctx->panel);
+ 	if (ret < 0)
+ 		return ret;
+diff --git a/drivers/gpu/drm/panel/panel-k10a-42-02-0b-dsc-vdo.c b/drivers/gpu/drm/panel/panel-k10a-42-02-0b-dsc-vdo.c
+--- a/drivers/gpu/drm/panel/panel-k10a-42-02-0b-dsc-vdo.c
++++ b/drivers/gpu/drm/panel/panel-k10a-42-02-0b-dsc-vdo.c
+@@ -27,6 +27,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/of_platform.h>
++#include <linux/of_graph.h>
+ #include <linux/platform_device.h>
+ #include <mt-plat/upmu_common.h>
+ #include <linux/double_click.h>
+@@ -549,19 +550,20 @@
+ static int lcm_disable(struct drm_panel *panel)
+ {
+ 	struct lcm *ctx;
++	int ret = 0;
+ 	ctx = panel_to_lcm(panel);
+ 	if (!ctx->enabled)
+ 		return 0;
+ 	
+ 	pr_info("%s +\n", __func__);
++	ctx->enabled = false;
++
+ 	if (ctx->backlight) {
+ 		ctx->backlight->props.power = FB_BLANK_POWERDOWN;
+-		backlight_update_status(ctx->backlight);
+-	}
+-
+-	ctx->enabled = false;
+-
+-	return 0;
++		ret = backlight_update_status(ctx->backlight);
++	}
++
++	return ret;
+ }
+ /*AVDD			-->	VSP  	  --> LM36273_VREG_DISP_P(GPIO126/bias0)*/
+ /*AVEE			-->	VSN		  --> LM36273_VREG_DISP_N(GPIO126/bias0)*/
+@@ -570,11 +572,15 @@
+ static int lcm_unprepare(struct drm_panel *panel)
+ {
+ 	struct lcm *ctx = panel_to_lcm(panel);
++	int ret;
+ 
+ 	pr_info("%s +\n", __func__);
+ 
+ 	if (!ctx->prepared)
+ 		return 0;
++
++	ret = lcm_disable(panel);
++	ctx->prepared = false;
+ 
+ 	push_table(ctx, lcm_suspend_setting, sizeof(lcm_suspend_setting) / sizeof(struct LCM_setting_table));
+ 
+@@ -605,7 +611,6 @@
+ 	}
+ 
+ 	ctx->error = 0;
+-	ctx->prepared = false;
+ 	ctx->hbm_en = false;
+ 	panel->panel_initialized = false;
+ 
+@@ -618,7 +623,7 @@
+ 	dsi_panel_HBM_count(ctx, 0, 1);
+ 
+ 	pr_info("%s -\n", __func__);
+-	return 0;
++	return ret;
+ }
+ 
+ static int lcm_prepare(struct drm_panel *panel)
+@@ -680,17 +685,23 @@
+ static int lcm_enable(struct drm_panel *panel)
+ {
+ 	struct lcm *ctx = panel_to_lcm(panel);
++	int ret;
+ 
+ 	if (ctx->enabled)
+ 		return 0;
+ 
+ 	pr_info("%s +\n", __func__);
++	ctx->enabled = true;
++
+ 	if (ctx->backlight) {
+ 		ctx->backlight->props.power = FB_BLANK_UNBLANK;
+-		backlight_update_status(ctx->backlight);
+-	}
+-
+-	ctx->enabled = true;
++		ret = backlight_update_status(ctx->backlight);
++		if (ret < 0) {
++			ctx->enabled = false;
++			ctx->backlight->props.power = FB_BLANK_POWERDOWN;
++			return ret;
++		}
++	}
+ 
+ 	return 0;
+ }
+@@ -1270,16 +1281,50 @@
+ static int lcm_setbacklight_i2c(struct drm_panel *panel, unsigned int level)
+ {
+ 	struct lcm *ctx = panel_to_lcm(panel);
++	int ret;
++
++	ret = lm36273_brightness_set(level);
++	if (ret < 0)
++		return ret;
+ 
+ 	bl_tb0[1] = (level >> 8) & 0x7;
+ 	bl_tb0[2] = level & 0xFF;
+-	lm36273_brightness_set(level);
+ 
+ 	/* add for display backlight count */
+ 	dsi_panel_backlight_count(ctx, level);
+ 
+ 	return 0;
+ }
++
++static int lcm_backlight_get_brightness(struct backlight_device *bl)
++{
++	struct lcm *ctx = bl_get_data(bl);
++
++	if (!ctx->prepared || !ctx->enabled ||
++	    bl->props.power != FB_BLANK_UNBLANK ||
++	    bl->props.fb_blank != FB_BLANK_UNBLANK ||
++	    bl->props.state & (BL_CORE_SUSPENDED | BL_CORE_FBBLANK))
++		return 0;
++
++	return bl->props.brightness;
++}
++
++static int lcm_backlight_update_status(struct backlight_device *bl)
++{
++	struct lcm *ctx = bl_get_data(bl);
++
++	if (!ctx->prepared)
++		return 0;
++
++	return lcm_setbacklight_i2c(&ctx->panel,
++				  lcm_backlight_get_brightness(bl));
++}
++
++static const struct backlight_ops lcm_backlight_ops = {
++	.options = BL_CORE_SUSPENDRESUME,
++	.update_status = lcm_backlight_update_status,
++	.get_brightness = lcm_backlight_get_brightness,
++};
+ 
+ static struct drm_display_mode *get_mode_by_id_hfp(struct drm_panel *panel,
+ 	unsigned int mode)
+@@ -1641,7 +1686,19 @@
+ 	struct device *dev = &dsi->dev;
+ 	struct lcm *ctx;
+ 	struct device_node *backlight;
++	struct device_node *endpoint, *remote_node;
+ 	int ret;
++
++	endpoint = of_graph_get_next_endpoint(dsi->host->dev->of_node, NULL);
++	if (!endpoint)
++		return -ENODEV;
++	remote_node = of_graph_get_remote_port_parent(endpoint);
++	of_node_put(endpoint);
++	if (!remote_node || remote_node != dev->of_node) {
++		of_node_put(remote_node);
++		return -ENODEV;
++	}
++	of_node_put(remote_node);
+ 
+ 	pr_info("%s+\n", __func__);
+ 	ctx = devm_kzalloc(dev, sizeof(struct lcm), GFP_KERNEL);
+@@ -1689,6 +1746,20 @@
+ 	ctx->panel_info = panel_name;
+ 	ctx->panel.panel_initialized = true;
+ 
++	if (!ctx->backlight) {
++		struct backlight_properties props = {
++			.type = BACKLIGHT_RAW,
++			.max_brightness = 2047,
++			.brightness = 600,
++			.power = FB_BLANK_UNBLANK,
++		};
++
++		ctx->backlight = devm_backlight_device_register(dev,
++				dev_name(dev), dev, ctx, &lcm_backlight_ops, &props);
++		if (IS_ERR(ctx->backlight))
++			return PTR_ERR(ctx->backlight);
++	}
++
+ 	ret = drm_panel_add(&ctx->panel);
+ 	if (ret < 0)
+ 		return ret;

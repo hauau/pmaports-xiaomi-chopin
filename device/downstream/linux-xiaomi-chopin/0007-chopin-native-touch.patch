@@ -1,0 +1,82 @@
+From: Nura maintainers <nura@localhost>
+Subject: [PATCH] input: enable the native Chopin Novatek host-download driver
+
+Expose the NVT36672c SPI driver already matched by Chopin's DT, rather
+than the different NT36672C implementation selected through MTK_TOUCH.
+Use the board firmware names and match both vendor and display maker
+from its configuration array. Fix the bootloader lockdown argument
+offset so native boot selects the same stock image without a DSI read.
+Select the firmware before registering the DRM notifier: its initial
+resume can precede the delayed boot firmware download.
+
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -16,6 +16,7 @@
+ source "drivers/input/touchscreen/focaltech_spi/Kconfig"
+ source "drivers/input/touchscreen/fts_spi/Kconfig"
+ source "drivers/input/touchscreen/NT36672C/Kconfig"
++source "drivers/input/touchscreen/NVT36672c/Kconfig"
+ 
+ config TOUCHSCREEN_PROPERTIES
+ 	def_tristate INPUT
+diff --git a/drivers/input/touchscreen/NVT36672c/nt36xxx.h b/drivers/input/touchscreen/NVT36672c/nt36xxx.h
+--- a/drivers/input/touchscreen/NVT36672c/nt36xxx.h
++++ b/drivers/input/touchscreen/NVT36672c/nt36xxx.h
+@@ -91,10 +91,10 @@
+ #define PACKET_PALM_OFF							4
+ 
+ #define BOOT_UPDATE_FIRMWARE					1
+-#define DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST		"novatek_ts_fw01.bin"
+-#define DEFAULT_MP_UPDATE_FIRMWARE_FIRST		"novatek_ts_mp01.bin"
+-#define DEFAULT_BOOT_UPDATE_FIRMWARE_SECOND		"novatek_ts_fw02.bin"
+-#define DEFAULT_MP_UPDATE_FIRMWARE_SECOND		"novatek_ts_mp02.bin"
++#define DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST		"novatek_nt36672c_k10a_fw01.bin"
++#define DEFAULT_MP_UPDATE_FIRMWARE_FIRST		"novatek_nt36672c_k10a_mp01.bin"
++#define DEFAULT_BOOT_UPDATE_FIRMWARE_SECOND		"novatek_nt36672c_k10a_fw02.bin"
++#define DEFAULT_MP_UPDATE_FIRMWARE_SECOND		"novatek_nt36672c_k10a_mp02.bin"
+ #define DEFAULT_DEBUG_FW_NAME					"novatek_debug_fw.bin"
+ #define DEFAULT_DEBUG_MP_NAME					"novatek_debug_mp.bin"
+ 
+diff --git a/drivers/input/touchscreen/NVT36672c/nt36xxx.c b/drivers/input/touchscreen/NVT36672c/nt36xxx.c
+--- a/drivers/input/touchscreen/NVT36672c/nt36xxx.c
++++ b/drivers/input/touchscreen/NVT36672c/nt36xxx.c
+@@ -1092,14 +1092,9 @@
+ 
+ 	for (i = 0; i < ts->config_array_size; i++) {
+ 
+-		if (lockdown[0] == panel_list[i].tp_vendor) {
+-			if(lockdown[0] == 0x46) {
+-				break;
+-			}
+-			if (lockdown[7] == panel_list[i].glass_vendor) {
+-				break;
+-			}
+-		}
++		if (lockdown[0] == panel_list[i].tp_vendor &&
++		    lockdown[1] == panel_list[i].display_maker)
++			break;
+ 	}
+ 
+ 	ts->panel_index = i;
+@@ -2431,6 +2426,8 @@
+ 	INIT_DELAYED_WORK(&ts->nvt_lockdown_work, get_lockdown_info);
+ 	/* please make sure boot update start after display reset(RESX) sequence*/
+ 	queue_delayed_work(nvt_lockdown_wq, &ts->nvt_lockdown_work, msecs_to_jiffies(1000));
++	/* Firmware is also needed by DRM resume before the boot update runs. */
++	nvt_match_fw();
+ 
+ #if WAKEUP_GESTURE
+ 	device_init_wakeup(&ts->input_dev->dev, 1);
+diff --git a/drivers/gpu/drm/mediatek/mi_disp/mi_dsi_panel.c b/drivers/gpu/drm/mediatek/mi_disp/mi_dsi_panel.c
+--- a/drivers/gpu/drm/mediatek/mi_disp/mi_dsi_panel.c
++++ b/drivers/gpu/drm/mediatek/mi_disp/mi_dsi_panel.c
+@@ -952,7 +952,7 @@
+ 				strlen(saved_command_line));
+ 
+ 	if (match && plockdowninfo) {
+-		memcpy(lockdown_str, (match + strlen("panel_lockdown=")),
++		memcpy(lockdown_str, (match + strlen("mtk_drm.panel_opt=")),
+ 			sizeof(lockdown_str) - 1);
+ 		if (sscanf(lockdown_str, "0x%02hhx,0x%02hhx,0x%02hhx,0x%02hhx,0x%02hhx,0x%02hhx,0x%02hhx,0x%02hhx",
+ 				&plockdowninfo[0], &plockdowninfo[1], &plockdowninfo[2], &plockdowninfo[3],

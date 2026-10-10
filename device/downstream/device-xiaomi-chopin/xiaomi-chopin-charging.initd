@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+
+# SPDX-License-Identifier: MIT
+description="Battery longevity charging policy for Xiaomi chopin"
+supervisor="supervise-daemon"
+command="/usr/libexec/xiaomi-chopin-charging"
+command_user="root"
+command_args="${charge_start:-55} ${charge_stop:-75} ${charge_current:-500000} ${warm_current:-250000} ${warm_temp:-320} ${stop_temp:-350} ${resume_temp:-300}"
+pidfile="/run/${RC_SVCNAME}.pid"
+respawn_delay=5
+
+depend() {
+	need udev
+	after localmount
+}
