@@ -1,0 +1,200 @@
+# Contributor: Carlo Landmeter
+# Contributor: Rasmus Thomsen <oss@cogitri.dev>
+# Contributor: Jakub Jirutka <jakub@jirutka.cz>
+# Based on Alpine community/polkit 127-r3; local r4 starts polkitd without root.
+# Keep OpenRC and D-Bus activation aligned so elogind can read /proc/self/fdinfo.
+maintainer="team/alpine-desktop <achill@achill.org>"
+pkgname=polkit
+pkgver=127
+pkgrel=4
+pkgdesc="Application development toolkit for controlling system-wide privileges"
+url="https://github.com/polkit-org/polkit"
+arch="all"
+license="GPL-2.0-or-later"
+# Scope the existing dev-package override for abuild's final dependency scan too.
+options="suid !check $pkgname-dev::!tracedeps"  # Needs a functioning dbus daemon
+makedepends="
+	duktape-dev
+	elogind-dev
+	expat-dev
+	glib-dev
+	gobject-introspection-dev
+	linux-pam-dev
+	meson
+	perl
+	"
+pkgusers="polkitd"
+pkggroups="polkitd"
+install="$pkgname-common.pre-install $pkgname-common.pre-upgrade"
+subpackages="
+	$pkgname-dev
+	$pkgname-noelogind-libs:libs
+	$pkgname-doc
+	$pkgname-lang
+	$pkgname-openrc
+	$pkgname-systemd
+	$pkgname-common
+	$pkgname-elogind
+	$pkgname-elogind-dev:_elogind_dev
+	$pkgname-elogind-libs:_elogind_libs
+	"
+source="https://github.com/polkit-org/polkit/archive/refs/tags/$pkgver/polkit-$pkgver.tar.gz
+	alpine-polkit.pam
+	polkit.initd
+	polkit-common.pre-install
+	polkit-common.pre-upgrade
+	dbus-activation-polkitd.patch
+	"
+
+# secfixes:
+#   0.120-r2:
+#     - CVE-2021-4034
+#   0.119-r0:
+#     - CVE-2021-3560
+
+build() {
+	msg 'Building without elogind'
+	_build no-elogind -Dsession_tracking="ConsoleKit"
+
+	msg 'Building with elogind'
+	_build elogind -Dsession_tracking="elogind"
+}
+
+_build() {
+	local outdir="$1"
+	shift
+	abuild-meson \
+		-Db_lto=true \
+		-Dtests="$(want_check && echo true || echo false)" \
+		-Dman=true \
+		"$@" \
+		. "$outdir"
+	meson compile -C "$outdir"
+}
+
+check() {
+	meson test --print-errorlogs -C elogind
+}
+
+package() {
+	provider_priority=100  # highest
+
+	depends="
+		$pkgname-common=$pkgver-r$pkgrel
+		$pkgname-noelogind-libs=$pkgver-r$pkgrel
+		"
+
+	DESTDIR="$pkgdir" meson install --no-rebuild -C no-elogind
+	DESTDIR="$builddir/elogind/dest" meson install --no-rebuild -C elogind
+
+	cd "$pkgdir"
+
+	# Use our own polkit rules, upstream may change them
+	install -m644 "$srcdir"/alpine-polkit.pam usr/lib/pam.d/polkit-1
+
+	# See polkit's configure script which tells us what permissions to set
+	chmod 4755 usr/lib/polkit-1/polkit-agent-helper-1
+	chmod 4755 usr/bin/pkexec
+
+	install -Dm755 "$srcdir"/polkit.initd etc/init.d/polkit
+}
+
+libs() {
+	provides="$pkgname-libs"
+	provider_priority=100  # highest
+
+	replaces="$pkgname-elogind-libs"
+
+	depends=""
+
+	default_libs
+}
+
+dev() {
+	default_dev
+
+	# XXX: We have to disable tracedeps to avoid abuild adding both
+	# polkit-libs and polkit-elogind-libs to depends - they are autodetected
+	# via symlinks in /usr/lib.
+	# XXX: Since we disabled tracedeps, all depends and provides must be
+	# specified. This sucks, but I don't know of a better solution (@jirutka).
+	depends="$depends_dev
+		$pkgname-common=$pkgver-r$pkgrel
+		$pkgname-libs
+		pc:gio-2.0>=2.18
+		pc:glib-2.0>=2.18
+		pkgconfig
+		"
+	provides="pc:polkit-agent-1=$pkgver pc:polkit-gobject-1=$pkgver"
+}
+
+elogind() {
+	pkgdesc="Polkit with elogind session tracking"
+	depends="$pkgname-elogind-libs=$pkgver-r$pkgrel $pkgname-common=$pkgver-r$pkgrel"
+	provides="$pkgname=$pkgver-r$pkgrel"
+	provider_priority=10  # lowest
+	replaces="$pkgname"  # for backward compatibility
+
+	cd "$builddir"/elogind/dest
+
+	mkdir -p "$subpkgdir"/usr/lib/polkit-1
+	mv usr/lib/polkit-1/polkitd "$subpkgdir"/usr/lib/polkit-1/
+}
+
+_elogind_dev() {
+	pkgdesc="Polkit with elogind session tracking (development files)"
+	depends="$pkgname-dev=$pkgver-r$pkgrel $pkgname-elogind-libs=$pkgver-r$pkgrel"
+	replaces="$pkgname-dev"
+
+	cd "$builddir"/elogind/dest
+
+	# *.gir files for the default and the elogind variant differ, the rest
+	# is the same.
+	mkdir -p "$subpkgdir"/usr/share
+	mv usr/share/gir-1.0 "$subpkgdir"/usr/share/
+}
+
+_elogind_libs() {
+	pkgdesc="Polkit with elogind session tracking (libraries)"
+	depends=""
+	provides="$pkgname-libs"
+	provider_priority=10  # lowest
+
+	# for backward compatibility/overwrite order
+	replaces="$pkgname-libs $pkgname-noelogind-libs $pkgname-elogind<=0.118"
+
+	cd "$builddir"/elogind/dest
+
+	mkdir -p "$subpkgdir"/usr/lib
+	mv usr/lib/lib*.so.* "$subpkgdir"/usr/lib/
+}
+
+common() {
+	pkgdesc="Common files for polkit and polkit-elogind"
+	depends=""
+	replaces="$pkgname $pkgname-elogind"  # for backward compatibility
+
+	# Move all that left to subpackage.
+	amove etc/*
+	amove usr/*
+
+	# Move polkitd back to the base package (that's the only file from the
+	# polkit package that differs between default and elogind variant).
+	mkdir -p "$pkgdir"/usr/lib/polkit-1
+	mv "$subpkgdir"/usr/lib/polkit-1/polkitd "$pkgdir"/usr/lib/polkit-1/
+}
+
+openrc() {
+	default_openrc
+	# polkit-elogind won't pull it otherwise
+	install_if="$pkgname-common=$pkgver-r$pkgrel openrc"
+}
+
+sha512sums="
+54b315f2ca05e957e7b9aafda16c1cddcc2266d6018c77dbf4cfe73b7d5b1569e6e07570884b9c5ecc4bdb3a29966169006aa727b089019d959208f2b53067e6  polkit-127.tar.gz
+f5102dc00d390b3a3c957b62e1712db778c7ffb7378f3d8e816c0757c11a308c5d5303e42595b0d6add9839247c773880cd34e56afacc89eb6efaadf9aae7826  alpine-polkit.pam
+0cae3721ad103a5babd8eb17eeb196ff909b3a664272ddbd2718168ba8095a2f8c7a5200fda219c0355a2181c101e4e4b8969ca5220a0f8a2229279cbe06c314  polkit.initd
+c312e1498ca5326db92c1d751c12946eeba05a51f5bdc0d897811d38b0f26fd33176581f37f54746a38d343d915d66c34fd1ca6b652ecd9076a84648a7e12463  polkit-common.pre-install
+c312e1498ca5326db92c1d751c12946eeba05a51f5bdc0d897811d38b0f26fd33176581f37f54746a38d343d915d66c34fd1ca6b652ecd9076a84648a7e12463  polkit-common.pre-upgrade
+5dd1644c128dc6eda3a37973508beeeb63f08e2bd7ce8a461e28b127185ed87d8233b7e4b1624480a3cbdb3184c1a9123aa39719423163b2080e3d77f88720ea  dbus-activation-polkitd.patch
+"

@@ -1,0 +1,13 @@
+Start polkitd as its dedicated account, as the OpenRC service does.
+Dropping root inside polkitd makes /proc/self/fdinfo root-owned on Linux,
+preventing elogind session lookup for authorization checks.
+
+--- a/data/org.freedesktop.PolicyKit1.service.in
++++ b/data/org.freedesktop.PolicyKit1.service.in
+@@ -1,5 +1,5 @@
+ [D-BUS Service]
+ Name=org.freedesktop.PolicyKit1
+ Exec=@libprivdir@/polkitd --no-debug
+-User=root
++User=polkitd
+ SystemdService=polkit.service
