@@ -1,0 +1,382 @@
+MediaTek hf_manager: expose native accelerometer and ALS through SensorProxy.
+
+Use the exact sensor/2.0 ABI, metadata gain, existing mount matrices and
+claim/refcount lifecycle. Explicitly disable on release/close and reconcile
+orphaned kernel state when opening. No synthetic readings or calibration writes.
+Support multiple sensor types on the same hotplugged hub.
+
+--- a/data/80-iio-sensor-proxy.rules
++++ b/data/80-iio-sensor-proxy.rules
+@@ -18,6 +18,9 @@
+ SUBSYSTEM=="iio", TEST=="in_proximity0_raw", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-proximity"
+ SUBSYSTEM=="input", ENV{ID_INPUT_ACCELEROMETER}=="1", ENV{IIO_SENSOR_PROXY_TYPE}+="input-accel"
+ 
++# MediaTek sensor hub (individual sensor availability is queried by the driver).
++SUBSYSTEM=="hf_manager", KERNEL=="hf_manager", ENV{IIO_SENSOR_PROXY_TYPE}+="hf-manager-accel hf-manager-als"
++
+ # Set the sensor type for all the types we recognise for SDSP/ADSP with libssc.
+ # Some devices expose the sensors via a separate SDSP while others re-use ADSP.
+ # These DSPs expose itself as /dev/fastrpc-* in the misc subsystem.
+--- a/src/drivers.h
++++ b/src/drivers.h
+@@ -160,6 +160,8 @@
+ extern SensorDriver iio_buffer_compass;
+ extern SensorDriver iio_poll_proximity;
+ extern SensorDriver input_proximity;
++extern SensorDriver hf_manager_accel;
++extern SensorDriver hf_manager_light;
+ 
+ #ifdef HAS_LIBSSC
+ extern SensorDriver ssc_proximity;
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -36,6 +36,7 @@
+   'drv-iio-buffer-compass.c',
+   'drv-iio-poll-proximity.c',
+   'drv-input-proximity.c',
++  'drv-hf-manager.c',
+   'iio-buffer-utils.c',
+   'accel-mount-matrix.c',
+   'accel-scale.c',
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -79,6 +79,8 @@
+ 	&iio_buffer_compass,
+ 	&iio_poll_proximity,
+ 	&input_proximity,
++	&hf_manager_accel,
++	&hf_manager_light,
+ #ifdef HAS_LIBSSC
+ 	&ssc_proximity,
+ 	&ssc_light,
+@@ -134,6 +136,8 @@
+ 	platform = g_udev_client_query_by_subsystem (client, "platform");
+ 	devices = g_list_concat (devices, input);
+ 	devices = g_list_concat (devices, platform);
++	devices = g_list_concat (devices,
++				g_udev_client_query_by_subsystem (client, "hf_manager"));
+ #ifdef HAS_LIBSSC
+ 	GList *fastrpc;
+ 	fastrpc = g_udev_client_query_by_subsystem (client, "misc");
+@@ -716,6 +720,7 @@
+ 		"iio",
+ 		"input",
+ 		"platform",
++		"hf_manager",
+ #ifdef HAS_LIBSSC
+ 		"misc",
+ #endif
+@@ -1116,7 +1121,6 @@
+ 						send_driver_changed_dbus_event (data, driver->type);
+ 					}
+ 				}
+-				break;
+ 			}
+ 		}
+ 	}
+--- /dev/null
++++ b/src/drv-hf-manager.c
+@@ -0,0 +1,303 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++
++#include "drivers.h"
++#include "accel-mount-matrix.h"
++#include "utils.h"
++
++#include <glib-unix.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++/* MediaTek sensor/2.0/core/hf_sensor_io.h: packed, four-byte aligned ABI.
++ * Commands return the device callback's status (zero), not a byte count. */
++typedef struct {
++	uint8_t sensor_type;
++	uint8_t padding[3];
++	uint32_t gain;
++	char name[16];
++	char vendor[16];
++} __attribute__((packed, aligned(4))) HfSensorInfo;
++
++typedef struct {
++	uint8_t sensor_type;
++	uint8_t padding[3];
++	union {
++		uint8_t status;
++		HfSensorInfo info;
++		uint8_t bytes[164];
++	} result;
++} __attribute__((packed, aligned(4))) HfPacket;
++
++typedef struct {
++	uint8_t sensor_type;
++	uint8_t action;
++	uint8_t length;
++	uint8_t padding;
++	int64_t delay;
++	int64_t latency;
++	uint8_t unused[32];
++} __attribute__((packed, aligned(4))) HfCommand;
++
++typedef struct {
++	int64_t timestamp;
++	uint8_t sensor_type;
++	uint8_t accuracy;
++	uint8_t action;
++	uint8_t padding;
++	int32_t word[16];
++} __attribute__((packed, aligned(4))) HfEvent;
++
++G_STATIC_ASSERT (sizeof (HfSensorInfo) == 40);
++G_STATIC_ASSERT (sizeof (HfPacket) == 168);
++G_STATIC_ASSERT (sizeof (HfCommand) == 52);
++G_STATIC_ASSERT (offsetof (HfCommand, delay) == 4);
++G_STATIC_ASSERT (sizeof (HfEvent) == 76);
++G_STATIC_ASSERT (offsetof (HfEvent, word) == 12);
++
++#define HF_REGISTER_STATUS _IOWR ('a', 1, HfPacket)
++#define HF_SENSOR_INFO     _IOWR ('a', 6, HfPacket)
++#define HF_READY_STATUS    _IOWR ('a', 8, HfPacket)
++#define HF_ACCEL           1
++#define HF_LIGHT           5
++#define HF_DATA            0
++
++/* One independent kernel client per sensor. The kernel merges rates across
++ * clients and only delivers this client's enabled sensors to its FIFO. */
++typedef struct {
++	SensorDevice sensor;
++	int fd;
++	uint8_t type;
++	guint watch_id;
++	gboolean enabled;
++	double factor;
++	AccelScale scale;
++	AccelVec3 *mount_matrix;
++} HfDevice;
++
++static gboolean
++hf_get_info (int fd, uint8_t type, HfSensorInfo *info)
++{
++	HfPacket packet = { .sensor_type = type };
++
++	if (ioctl (fd, HF_READY_STATUS, &packet) < 0 || !packet.result.status)
++		return FALSE;
++	if (ioctl (fd, HF_REGISTER_STATUS, &packet) < 0 || !packet.result.status)
++		return FALSE;
++	if (ioctl (fd, HF_SENSOR_INFO, &packet) < 0)
++		return FALSE;
++	if (packet.result.info.sensor_type != type || packet.result.info.gain == 0)
++		return FALSE;
++	*info = packet.result.info;
++	return TRUE;
++}
++
++static gboolean
++hf_discover (GUdevDevice *device, uint8_t type, const char *match)
++{
++	g_auto(IioFd) fd = -1;
++	HfSensorInfo info;
++	const char *path;
++
++	if (!drv_check_udev_sensor_type (device, match, NULL))
++		return FALSE;
++	path = g_udev_device_get_device_file (device);
++	if (!path)
++		return FALSE;
++	fd = open (path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0 || !hf_get_info (fd, type, &info))
++		return FALSE;
++	g_debug ("Found hf_manager sensor %u: %.*s (%.*s)",
++		 type, 16, info.name, 16, info.vendor);
++	return TRUE;
++}
++
++static gboolean
++hf_accel_discover (GUdevDevice *device)
++{
++	return hf_discover (device, HF_ACCEL, "hf-manager-accel");
++}
++
++static gboolean
++hf_light_discover (GUdevDevice *device)
++{
++	return hf_discover (device, HF_LIGHT, "hf-manager-als");
++}
++
++static gboolean
++hf_control (int fd, uint8_t type, gboolean enabled)
++{
++	HfCommand command = {
++		.sensor_type = type,
++		.action = enabled ? 1 : 0,
++		.length = enabled ? 16 : 0,
++		.delay = type == HF_ACCEL ? 200000000 : 500000000,
++	};
++	ssize_t ret;
++
++	ret = write (fd, &command, sizeof (command));
++	if (ret != 0) {
++		g_warning ("Could not %s hf_manager sensor %u: %s",
++			   enabled ? "enable" : "disable", type,
++			   ret < 0 ? g_strerror (errno) : "unexpected command result");
++		return FALSE;
++	}
++	g_debug ("hf_manager sensor %u %s", type, enabled ? "enabled" : "disabled");
++	return TRUE;
++}
++
++static void
++hf_set_polling (SensorDevice *sensor_device, gboolean state);
++
++static gboolean
++hf_read_events (gint fd, GIOCondition condition, gpointer user_data)
++{
++	SensorDevice *sensor_device = user_data;
++	HfDevice *data = sensor_device->priv;
++	HfEvent events[16];
++	ssize_t len;
++	gsize i;
++
++	if (condition & (G_IO_ERR | G_IO_HUP | G_IO_NVAL)) {
++		g_warning ("hf_manager sensor %u disconnected", data->type);
++		goto stop;
++	}
++	len = read (fd, events, sizeof (events));
++	if (len < 0 && (errno == EAGAIN || errno == EINTR))
++		return G_SOURCE_CONTINUE;
++	if (len < 0 || len % sizeof (HfEvent) != 0) {
++		g_warning ("Could not read hf_manager sensor %u: %s", data->type,
++			   len < 0 ? g_strerror (errno) : "incomplete event record");
++		goto stop;
++	}
++	/* An empty FIFO returns zero; it is not EOF for this ABI. */
++	for (i = 0; i < (gsize) len / sizeof (HfEvent); i++) {
++		const HfEvent *event = &events[i];
++
++		if (event->sensor_type != data->type || event->action != HF_DATA)
++			continue;
++		if (data->type == HF_ACCEL) {
++			/* The hub reports the Android device frame: +x right, +y up,
++			 * +z out of the screen, +g along the axis pointing up.
++			 * orientation_calc() expects normal <=> y = -g, right-up <=> x = -g
++			 * and face-up <=> z = +g (see test-orientation.c), so negate x and y
++			 * before any device-specific udev mount matrix. */
++			AccelVec3 vector = { -event->word[0], -event->word[1], event->word[2] };
++			AccelReadings readings;
++
++			apply_mount_matrix (data->mount_matrix, &vector);
++			readings.accel_x = vector.x;
++			readings.accel_y = vector.y;
++			readings.accel_z = vector.z;
++			readings.scale = data->scale;
++			sensor_device->callback_func (sensor_device, &readings, sensor_device->user_data);
++		} else {
++			LightReadings readings = {
++				.level = event->word[0] * data->factor,
++				.uses_lux = TRUE,
++			};
++
++			sensor_device->callback_func (sensor_device, &readings, sensor_device->user_data);
++		}
++	}
++	return G_SOURCE_CONTINUE;
++
++stop:
++	data->watch_id = 0;
++	hf_set_polling (sensor_device, FALSE);
++	return G_SOURCE_REMOVE;
++}
++
++static void
++hf_set_polling (SensorDevice *sensor_device, gboolean state)
++{
++	HfDevice *data = sensor_device->priv;
++
++	if (state) {
++		if (data->watch_id)
++			return;
++		if (!hf_control (data->fd, data->type, TRUE))
++			return;
++		data->enabled = TRUE;
++		data->watch_id = g_unix_fd_add (data->fd, G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
++					      hf_read_events, sensor_device);
++	} else {
++		g_clear_handle_id (&data->watch_id, g_source_remove);
++		if (data->enabled && hf_control (data->fd, data->type, FALSE))
++			data->enabled = FALSE;
++	}
++}
++
++static SensorDevice *
++hf_open (GUdevDevice *device, uint8_t type)
++{
++	g_auto(IioFd) fd = -1;
++	HfSensorInfo info;
++	HfDevice *data;
++	const char *path = g_udev_device_get_device_file (device);
++
++	if (!path)
++		return NULL;
++	fd = open (path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0 || !hf_get_info (fd, type, &info))
++		return NULL;
++	/* Kernel close removes the client without recomputing active sensors.
++	 * Reconcile orphaned state on restart, preserving other live clients. */
++	if (!hf_control (fd, type, FALSE))
++		return NULL;
++	data = g_new0 (HfDevice, 1);
++	data->fd = fd;
++	fd = -1;
++	data->type = type;
++	data->factor = 1.0 / info.gain;
++	data->sensor.priv = data;
++	data->sensor.name = g_strndup (info.name, sizeof (info.name));
++	if (type == HF_ACCEL) {
++		data->mount_matrix = setup_mount_matrix (device);
++		set_accel_scale (&data->scale, data->factor);
++	}
++	return &data->sensor;
++}
++
++static SensorDevice *
++hf_accel_open (GUdevDevice *device)
++{
++	return hf_open (device, HF_ACCEL);
++}
++
++static SensorDevice *
++hf_light_open (GUdevDevice *device)
++{
++	return hf_open (device, HF_LIGHT);
++}
++
++static void
++hf_close (SensorDevice *sensor_device)
++{
++	HfDevice *data = sensor_device->priv;
++
++	close (data->fd);
++	g_free (data->mount_matrix);
++	g_free (data);
++}
++
++SensorDriver hf_manager_accel = {
++	.driver_name = "MediaTek hf_manager accelerometer",
++	.type = DRIVER_TYPE_ACCEL,
++	.discover = hf_accel_discover,
++	.open = hf_accel_open,
++	.set_polling = hf_set_polling,
++	.close = hf_close,
++};
++
++SensorDriver hf_manager_light = {
++	.driver_name = "MediaTek hf_manager ambient light",
++	.type = DRIVER_TYPE_LIGHT,
++	.discover = hf_light_discover,
++	.open = hf_light_open,
++	.set_polling = hf_set_polling,
++	.close = hf_close,
++};
