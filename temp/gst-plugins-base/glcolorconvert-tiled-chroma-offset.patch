@@ -1,0 +1,24 @@
+Subject: [PATCH] glcolorconvert: pass the chroma tile half as an int
+
+frag_to_tile() takes the chroma tile half offset as an int, but the tiled
+semi-planar shader passed an ivec2. GLSL has no implicit ivec2 to int
+conversion, so conforming compilers (Mesa's included) reject the shader:
+
+  error: no matching function for call to
+  `frag_to_tile(ivec2, ivec2, ivec2, int, int, ivec2)'
+
+and every NV12_16L32S/NV12_4L4 conversion failed with "Failed to convert
+video buffer", breaking glimagesink and WebKit playback of V4L2 decoder
+output in MediaTek's MM21 layout.
+
+--- a/gst-libs/gst/gl/gstglcolorconvert.c
++++ b/gst-libs/gst/gl/gstglcolorconvert.c
+@@ -465,7 +465,7 @@
+     "  yuva.x = texelFetch(Ytex, texel, 0).r;\n"
+     "\n"
+     "  ivec2 chroma_tcoord = ivec2(tile_coord.x, tile_coord.y / fy);\n"
+-    "  texel = frag_to_tile(chroma_tcoord, delta_coord / 2, chroma_dim, iwidth / 2, tiles_per_row, ivec2(mod(float(tile_coord.y), float(fy))));\n"
++    "  texel = frag_to_tile(chroma_tcoord, delta_coord / 2, chroma_dim, iwidth / 2, tiles_per_row, int(mod(float(tile_coord.y), float(fy))));\n"
+     "  yuva.yz = texelFetch(UVtex, texel, 0).%c%c;\n"
+     "  yuva.a = 1.0;\n"
+     "\n"
