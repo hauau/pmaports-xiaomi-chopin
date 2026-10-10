@@ -1,3 +1,7 @@
+> **This is the `xiaomi-chopin` branch**, an unofficial port of Nura to the Xiaomi chopin
+> (Redmi Note 10 Pro 5G / POCO X3 GT). See [xiaomi-chopin/README.md](xiaomi-chopin/README.md)
+> for its status and installation guide.
+
 # postmarketOS aports repository
 
 This repository contains the APKBUILD files for postmarketOS-specific packages, along with the required patches and scripts, if any.
