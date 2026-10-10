@@ -1,0 +1,29 @@
+From: postmarketOS chopin bring-up
+Subject: [PATCH] panfrost: publish exclusive fences for native JM external BOs
+
+JM already conservatively orders every submitted BO access as exclusive, but
+passes imported dma-bufs to kbase with the shared/read-only access bit. Even
+with implicit kernel fences enabled, that publishes only shared reader fences,
+which other readers and scanout need not wait for.
+
+Match the existing JM access model when submitting external resources. This
+publishes producer write fences without adding CPU waits or changing CSF.
+
+--- a/src/panfrost/base/pan_vX_base.c
++++ b/src/panfrost/base/pan_vX_base.c
+@@ -86 +86,2 @@
+ #include "old/mali-props.h"
++#define BASE_EXT_RES_ACCESS_EXCLUSIVE MALI_EXT_RES_ACCESS_EXCLUSIVE
+@@ -1171,8 +1171,11 @@
+                 handle_buf[h].last_access[slot] = nr;
+                 ++handle_buf[h].use_count;
+ 
++                /* JM tracks all BO accesses conservatively as exclusive;
++                 * external readers must see a matching producer fence. */
+                 if (handle_buf[h].fd != -1)
+-                        util_dynarray_append(&extres, base_va, handle_buf[h].va);
++                        util_dynarray_append(&extres, base_va,
++                                             handle_buf[h].va | BASE_EXT_RES_ACCESS_EXCLUSIVE);
+         }
+ 
+         pthread_mutex_unlock(&k->handle_lock);

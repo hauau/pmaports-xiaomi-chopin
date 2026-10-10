@@ -1,0 +1,47 @@
+Subject: [PATCH] panfrost: restore Valhall JM shader state
+
+The CSF changes left the v9 varying shader with only a program pointer
+and marked all shader programs as secondary. Restore Mesa 23.0.0's JM
+state: complete varying environments and primary programs for generic
+and position shaders. Keep the varying program secondary and leave CSF
+unchanged. Reuse the position environment instead of allocating the same
+resource and uniform tables twice.
+
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -3965,9 +3965,10 @@ panfrost_emit_malloc_vertex(struct panfrost_batch *batch,
+                         mali_ptr ptr = batch->rsd[PIPE_SHADER_VERTEX] +
+                                 (2 * pan_size(SHADER_PROGRAM));
+ 
++#if PAN_ARCH == 9
++                        vary = cfg;
++#endif
+                         vary.shader = ptr;
+-
+-                        // TODO: Fix this function for v9!
+                 }
+         }
+ }
+@@ -5217,12 +5218,10 @@ prepare_shader(struct panfrost_compiled_shader *state,
+ 
+         state->state = panfrost_pool_take_ref(pool, ptr.gpu);
+ 
+-        // TODO: Why set primary_shader to false again?
+-
+         /* Generic, or IDVS/points */
+         pan_pack(ptr.cpu, SHADER_PROGRAM, cfg) {
+                 cfg.stage = pan_shader_stage(&state->info);
+-                cfg.primary_shader = false;
++                cfg.primary_shader = PAN_ARCH == 9;
+                 cfg.register_allocation = pan_register_allocation(state->info.work_reg_count);
+                 cfg.binary = state->bin.gpu;
+                 cfg.preload.r48_r63 = (state->info.preload >> 48);
+@@ -5238,7 +5237,7 @@ prepare_shader(struct panfrost_compiled_shader *state,
+         /* IDVS/triangles */
+         pan_pack(ptr.cpu + pan_size(SHADER_PROGRAM), SHADER_PROGRAM, cfg) {
+                 cfg.stage = pan_shader_stage(&state->info);
+-                cfg.primary_shader = false;
++                cfg.primary_shader = PAN_ARCH == 9;
+                 cfg.register_allocation = pan_register_allocation(state->info.work_reg_count);
+                 cfg.binary = state->bin.gpu + state->info.vs.no_psiz_offset;
+                 cfg.preload.r48_r63 = (state->info.preload >> 48);

@@ -1,0 +1,87 @@
+Subject: [PATCH] panfrost/kbase: make EGL-image resources exportable
+
+kbase cannot export native allocations, so eglExportDMABUFImageMESA on an
+image made from an ordinary texture failed and clients such as GTK fell
+back to copying. Implement flush_resource, which the DRI frontend calls
+with the owning context when such an image is created: move the resource
+once into a display-allocated dma-buf imported into kbase, exactly like
+shared resources at creation, then swap the BO. The swap flushes and waits
+for all GPU access and copies the contents with cache maintenance; sampler
+views revalidate on the new address. Existing external-resource fences
+cover synchronization of the now-shared buffer.
+
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -255,10 +255,71 @@
+         }
+ }
+ 
++/* kbase has no ioctl to export a native allocation as a dma-buf. The DRI
++ * frontend calls flush_resource with the owning context before an EGL image
++ * made from a texture or renderbuffer can be exported, so move such a
++ * resource once into the same display-allocated dma-buf (imported into
++ * kbase) that shared and scanout resources use. Later rendering then goes
++ * straight into the exportable buffer, and the existing external-resource
++ * fences synchronize producers and consumers.
++ */
+ static void
+ panfrost_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+ {
+-        /* TODO */
++        struct panfrost_context *ctx = pan_context(pctx);
++        struct panfrost_device *dev = pan_device(pctx->screen);
++        struct panfrost_resource *rsrc = pan_resource(prsc);
++        struct panfrost_bo *old = rsrc->image.data.bo;
++        size_t size = rsrc->image.layout.data_size;
++
++        if (!dev->kbase || !dev->ro || !old || (old->flags & PAN_BO_SHARED) ||
++            rsrc->scanout || rsrc->separate_stencil || prsc->next ||
++            (prsc->target != PIPE_TEXTURE_2D && prsc->target != PIPE_TEXTURE_RECT) ||
++            prsc->array_size != 1 || prsc->nr_samples > 1 ||
++            util_format_get_blockwidth(prsc->format) != 1 ||
++            util_format_get_blockheight(prsc->format) != 1)
++                return;
++
++        /* Same dumb-buffer sizing as shared resources at creation. */
++        struct pan_block_size blocksize =
++                panfrost_block_size(rsrc->image.layout.modifier, prsc->format);
++        unsigned width = ALIGN_POT(prsc->width0, blocksize.width);
++        unsigned stride = width * util_format_get_blocksize(prsc->format);
++        struct pipe_resource tmpl = {
++                .target = prsc->target,
++                .format = prsc->format,
++                .width0 = width,
++                .height0 = DIV_ROUND_UP(size, stride),
++                .depth0 = 1,
++                .array_size = 1,
++        };
++        struct winsys_handle handle;
++        struct renderonly_scanout *scanout =
++                renderonly_scanout_for_resource(&tmpl, dev->ro, &handle);
++
++        if (!scanout)
++                return;
++
++        struct panfrost_bo *bo = panfrost_bo_import(dev, handle.handle);
++        close(handle.handle);
++        if (!bo || bo->size < size) {
++                panfrost_bo_unreference(bo);
++                renderonly_scanout_destroy(scanout, dev->ro);
++                return;
++        }
++
++        /* Carry the current contents over once all GPU access finished. */
++        panfrost_flush_batches_accessing_rsrc(ctx, rsrc, "Make resource shareable");
++        panfrost_bo_wait(old, INT64_MAX, true);
++        panfrost_bo_mem_invalidate(old, 0, size);
++        memcpy(bo->ptr.cpu, old->ptr.cpu, size);
++        panfrost_bo_mem_clean(bo, 0, size);
++
++        panfrost_resource_swap_bo(ctx, rsrc, bo);
++        panfrost_bo_mmap_scanout(bo, dev->ro, scanout);
++        rsrc->scanout = scanout;
++        rsrc->modifier_constant = true;
++        panfrost_dirty_state_all(ctx);
+ }
+ 
+ static struct pipe_surface *

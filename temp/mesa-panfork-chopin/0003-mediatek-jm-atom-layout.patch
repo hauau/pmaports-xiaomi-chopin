@@ -1,0 +1,25 @@
+Subject: [PATCH] base/jm: match MediaTek bandwidth-QoS atom layout
+
+Chopin's mt6885-family kbase build enables MTK_GPU_BM_2, which appends a
+frame number to both JM atom layouts. Without it, the 56-byte v2 atom is
+mistaken for a truncated v3 atom and job submission fails with bad padding.
+Use the actual board ABI, including its zero-initialized frame number.
+
+--- a/src/panfrost/base/include/jm/mali_base_jm_kernel.h
++++ b/src/panfrost/base/include/jm/mali_base_jm_kernel.h
+@@ -646,6 +646,7 @@ struct base_jd_atom_v2 {
+ 	__u8 jobslot;
+ 	base_jd_core_req core_req;
+ 	__u8 renderpass_id;
+ 	__u8 padding[7];
++	__u32 frame_nr;
+ };
+ 
+@@ -694,6 +695,7 @@ typedef struct base_jd_atom {
+ 	__u8 jobslot;
+ 	base_jd_core_req core_req;
+ 	__u8 renderpass_id;
+ 	__u8 padding[7];
++	__u32 frame_nr;
+ } base_jd_atom;
+ 

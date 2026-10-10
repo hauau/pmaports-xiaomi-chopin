@@ -1,0 +1,30 @@
+Subject: [PATCH] panfrost: keep CSF heap headers and tiler state out of JM
+
+Mesa 23.0.0 starts the JM heap at its base and initializes the tiler state
+to zero. The CSF merge added a 64-byte heap header and nonzero state words
+unconditionally. On G77, that heap offset corrupts vertex packets when
+several draws share a batch. Keep both CSF requirements on v10 and later
+and restore the JM initialization without splitting draws or CPU waits.
+
+--- a/src/panfrost/lib/pan_cs.c
++++ b/src/panfrost/lib/pan_cs.c
+@@ -958,7 +958,7 @@ GENX(pan_emit_tiler_heap)(const struct panfrost_device *dev,
+         pan_pack(out, TILER_HEAP, heap) {
+                 heap.size = dev->tiler_heap->size;
+                 heap.base = dev->tiler_heap->ptr.gpu;
+-                heap.bottom = dev->tiler_heap->ptr.gpu + 64;
++                heap.bottom = heap.base + (PAN_ARCH >= 10 ? 64 : 0);
+                 heap.top = dev->tiler_heap->ptr.gpu + dev->tiler_heap->size;
+         }
+ }
+@@ -1000,8 +1000,10 @@ GENX(pan_emit_tiler_ctx)(const struct panfrost_device *dev,
+ #if PAN_ARCH >= 9
+                 tiler.first_provoking_vertex = first_provoking_vertex;
+ #endif
++#if PAN_ARCH >= 10
+                 tiler.state.word1 = 31;
+                 tiler.state.word3 = 0x10000000;
++#endif
+         }
+ }
+ #endif

@@ -1,0 +1,149 @@
+Subject: [PATCH] kbase: retain JM buffers until their submission events complete
+
+The CSF deferred-free callback path saw no active queues on JM. That
+returned batch pools and AFBC upload staging buffers to the BO cache while
+the GPU still used them, so the next draw overwrote live descriptors.
+
+Publish JM atom submission/completion markers to the existing callback
+queues. Run retirement callbacks without queue_lock: BO release takes
+bo_map_lock, while unreference registers callbacks in the opposite order.
+No forced GPU waits or rendering-mode changes are needed.
+
+--- a/src/panfrost/base/pan_vX_base.c
++++ b/src/panfrost/base/pan_vX_base.c
+@@ -913,3 +913,33 @@
++static void
++kbase_update_queue_callbacks(kbase k,
++                             struct kbase_event_slot *slot,
++                             uint64_t seqnum)
++{
++        struct kbase_sync_link **list = &slot->syncobjs;
++
++        while (*list) {
++                struct kbase_sync_link *link = *list;
++
++                LOG("seq %"PRIu64" %"PRIu64"\n", seqnum, link->seqnum);
++
++                /* Items in the list should be in order, there is no need to
++                 * check any more if we can't process this link yet. */
++                if (seqnum <= link->seqnum)
++                        break;
++
++                *list = link->next;
++                if (&link->next == slot->back)
++                        slot->back = list;
++
++                /* BO callbacks acquire bo_map_lock, not under queue_lock. */
++                pthread_mutex_unlock(&k->queue_lock);
++                LOG("done, calling %p(%p)\n", link->callback, link->data);
++                link->callback(link->data);
++                free(link);
++                pthread_mutex_lock(&k->queue_lock);
++        }
++}
++
+ #if PAN_BASE_API < 2
+ static bool
+ kbase_handle_events(kbase k)
+@@ -938,7 +938,4 @@
+                 pthread_mutex_lock(&k->handle_lock);
+ 
+-                /* Fence checks track the next unfinished sequence. */
+-                k->event_slots[event.atom_number].last = event.udata.blob[0] + 1;
+-
+                 unsigned size = util_dynarray_num_elements(&k->gem_handles,
+                                                            kbase_handle);
+@@ -955,6 +955,13 @@
+                 util_dynarray_fini(handles);
+ 
+                 pthread_mutex_unlock(&k->handle_lock);
++
++                pthread_mutex_lock(&k->queue_lock);
++                struct kbase_event_slot *slot = &k->event_slots[event.atom_number];
++                /* Fence checks track the next unfinished sequence. */
++                slot->last = event.udata.blob[0] + 1;
++                kbase_update_queue_callbacks(k, slot, slot->last);
++                pthread_mutex_unlock(&k->queue_lock);
+         }
+ 
+         return ret;
+@@ -1041,30 +1041,3 @@
+-static void
+-kbase_update_queue_callbacks(kbase k,
+-                             struct kbase_event_slot *slot,
+-                             uint64_t seqnum)
+-{
+-        struct kbase_sync_link **list = &slot->syncobjs;
+-        struct kbase_sync_link **back = slot->back;
+-
+-        while (*list) {
+-                struct kbase_sync_link *link = *list;
+-
+-                LOG("seq %"PRIu64" %"PRIu64"\n", seqnum, link->seqnum);
+-
+-                /* Items in the list should be in order, there is no need to
+-                 * check any more if we can't process this link yet. */
+-                if (seqnum <= link->seqnum)
+-                        break;
+-
+-                LOG("done, calling %p(%p)\n", link->callback, link->data);
+-                link->callback(link->data);
+-                *list = link->next;
+-                if (&link->next == back)
+-                        slot->back = list;
+-                free(link);
+-        }
+-}
+-
+ static bool
+ kbase_handle_events(kbase k)
+ {
+@@ -1085,4 +1085,5 @@
+                 uint64_t seqnum = event_mem[i * 2];
+                 uint64_t cmp = k->event_slots[i].last;
++                k->event_slots[i].last = seqnum;
+ 
+                 LOG("MAIN SEQ %"PRIu64" > %"PRIu64"?\n", seqnum, cmp);
+@@ -1099,8 +1099,5 @@
+                                                      seqnum);
+                 }
+-
+-                /* TODO: Atomic operations? */
+-                k->event_slots[i].last = seqnum;
+         }
+ 
+         pthread_mutex_unlock(&k->queue_lock);
+@@ -1185,9 +1185,11 @@
+-        /* TODO: Better work out the difference between handle_lock and
+-         * queue_lock. */
+-        if (o) {
+-                pthread_mutex_lock(&k->queue_lock);
++        pthread_mutex_lock(&k->queue_lock);
++        struct kbase_event_slot *event_slot = &k->event_slots[nr];
++        if (!event_slot->back)
++                event_slot->back = &event_slot->syncobjs;
++        event_slot->last_submit = atom.udata.blob[0] + 1;
++        k->event_slot_usage = MAX2(k->event_slot_usage, (unsigned) nr + 1);
++        if (o)
+                 kbase_syncobj_update_fence(o, nr, atom.udata.blob[0]);
+-                pthread_mutex_unlock(&k->queue_lock);
+-        }
++        pthread_mutex_unlock(&k->queue_lock);
+ 
+         assert(KBASE_SLOT_COUNT == 2);
+@@ -1676,4 +1676,3 @@
+-// TODO: Only define for CSF kbases?
+ static bool
+ kbase_callback_all_queues(kbase k, int32_t *count,
+                           void (*callback)(void *), void *data)
+@@ -1693,5 +1693,10 @@
+                 *link = (struct kbase_sync_link) {
+                         .next = NULL,
++                        /* JM last_submit is the raw submission sequence + 1. */
++#if PAN_BASE_API < 2
++                        .seqnum = slot->last_submit - 1,
++#else
+                         .seqnum = slot->last_submit,
++#endif
+                         .callback = callback,
+                         .data = data,

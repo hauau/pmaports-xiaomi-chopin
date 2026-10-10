@@ -1,0 +1,20 @@
+Subject: [PATCH] kbase: never submit JM jobs with dependency sentinel ID zero
+
+The JM ABI ignores pre-dependencies whose atom_id is zero. Submitting the
+first vertex/tiler job as atom zero therefore lets the fragment job run
+before tiling finishes. Later frames hide the race; synchronous tracing
+also hides it. Skip zero both at context startup and on uint8_t wraparound.
+
+--- a/src/panfrost/base/pan_vX_base.c
++++ b/src/panfrost/base/pan_vX_base.c
+@@ -1133,7 +1133,10 @@ kbase_submit(kbase k, uint64_t va, unsigned req,
+         unsigned slot = (req & PANFROST_JD_REQ_FS) ? 0 : 1;
+         unsigned dep_slots[KBASE_SLOT_COUNT];
+ 
+         uint8_t nr = k->atom_number++;
++        /* Atom ID zero means no dependency in the JM ABI. */
++        if (!nr)
++                nr = k->atom_number++;
+ 
+         struct base_jd_atom_v2 atom = {
+                 .jc = va,

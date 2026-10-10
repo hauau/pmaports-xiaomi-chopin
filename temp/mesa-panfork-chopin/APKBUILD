@@ -1,0 +1,105 @@
+pkgname=mesa-panfork-chopin
+pkgver=23.0.0_git20240119
+pkgrel=12
+pkgdesc="Native Mali-G77 kbase graphics backend for Xiaomi chopin"
+url="https://github.com/ROCKNIX/mesa-panfork"
+arch="aarch64"
+license="MIT AND SGI-B-2.0 AND BSL-1.0"
+options="!check"
+makedepends="
+	bison
+	expat-dev
+	flex
+	libdrm-dev
+	libx11-dev
+	libxdamage-dev
+	libxext-dev
+	libxfixes-dev
+	libxrandr-dev
+	libxshmfence-dev
+	libxxf86vm-dev
+	meson
+	py3-mako
+	py3-packaging
+	py3-ply
+	py3-yaml
+	python3
+	wayland-dev
+	wayland-protocols
+	xorgproto
+	zlib-dev
+	zstd-dev
+	"
+_commit=832c3c7117e4366e415ded92a6f07ec203fd9233
+_prefix=/usr/lib/chopin-gpu
+ldpath="$_prefix/lib"
+sonameprefix="$pkgname:"
+source="$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz
+	0001-mali-g77-model.patch
+	0002-python-version-check.patch
+	0003-mediatek-jm-atom-layout.patch
+	0004-valhall-jm-shader-state.patch
+	0005-valhall-jm-tiler-state.patch
+	0006-native-jm-completion.patch
+	0007-jm-reserved-dependency-atom.patch
+	0008-native-jm-bo-lifetime.patch
+	0009-egl-dmabuf-export-failure.patch
+	0010-native-jm-external-write-fences.patch
+	0011-kbase-exportable-egl-images.patch
+	0012-egl-surfaceless-primary-node.patch
+	"
+builddir="$srcdir/mesa-panfork-$_commit"
+
+build() {
+	# Keep the older kbase backend separate from the system Mesa installation.
+	abuild-meson \
+		--prefix="$_prefix" \
+		--libdir=lib \
+		--bindir=bin \
+		--includedir=include \
+		--datadir=share \
+		--sysconfdir="$_prefix/etc" \
+		--libexecdir=libexec \
+		-Dgallium-drivers=kmsro,panfrost \
+		-Dvulkan-drivers= \
+		-Dplatforms=x11,wayland \
+		-Degl=enabled \
+		-Dgbm=enabled \
+		-Dgles1=disabled \
+		-Dgles2=enabled \
+		-Dglx=dri \
+		-Dglvnd=false \
+		-Dllvm=disabled \
+		-Dshared-glapi=enabled \
+		-Dgallium-vdpau=disabled \
+		-Dgallium-va=disabled \
+		-Dgallium-xa=disabled \
+		-Dgallium-opencl=disabled \
+		-Dgallium-rusticl=false \
+		-Dbuild-tests=false \
+		-Dvalgrind=disabled \
+		-Ddri-drivers-path="$_prefix/lib/dri" \
+		. output
+	meson compile -C output
+}
+
+package() {
+	DESTDIR="$pkgdir" meson install --no-rebuild -C output
+	rm -r "$pkgdir$_prefix/include" "$pkgdir$_prefix/lib/pkgconfig"
+}
+
+sha512sums="
+929e4a86e8de8e68920366cc939b618a7bb52f47718f3ffc6f11d0951ce4addd12b13647d3df31672a5e064d3ed845c13079a2ae5505894cbe75c397b04257d5  mesa-panfork-chopin-832c3c7117e4366e415ded92a6f07ec203fd9233.tar.gz
+33fdee9c3bb6a43030785387fc0046581ea6736f8955fa4b1ca2da932c8a69f1956120f9c22049b1889e9e4ec6fab164ce51763b53c060860dd0dcdae811f64f  0001-mali-g77-model.patch
+104cae776a318a9c00225ed7e23c3c3408e5bfd2d5cb534255d626c76f324b5e0aaba9a653c62831eaac853e8d6b624ef9062efb8ec50a855c473ccde0bb32f0  0002-python-version-check.patch
+65837adbdea00313ba87e7edd3d1a00a497f53a04752b27720a16fa64baaa29d2af1a9b38fefbbedddca58d570b097aad24098f8e17dc42214e67a053ba6a2b3  0003-mediatek-jm-atom-layout.patch
+2d25b521151094eff62cc67809e357b2569604509394a16b3de8dccd519ace113ad4d39f40a0b21403a08322017c4fabae911db6644fcd419f9b52dcaa5d3cc6  0004-valhall-jm-shader-state.patch
+60a64d1b555af197933bfe7f9b9447d70c7e7f6fa959959b9965111e8f1ebfffa2e915555be1efb70ced9e54d11818a9fd6b70447633f785fb82b9ed14c26123  0005-valhall-jm-tiler-state.patch
+e6fdd6a2ad4600118b7a5171b3332a3ede43e35be7d0b8fffbd23bf282abe383779c5f6a9de400924dc40bff06f4fba45bd36952ccf85aa3d4a34e779741750c  0006-native-jm-completion.patch
+9795583b4e747598c5ad08f701e402969db2a1b29ad8d338b768e436984a47271ea1f131cf6c2c0d7fd4107e77dd28e028599231aad8193747fd0e2a904039af  0007-jm-reserved-dependency-atom.patch
+bb5abf6a6528ca7624ad55fdd3c8ba2c23e570cab8df7c44b0e1e388a0af535c1bbaeeadaef68ca01fbfebb8f19148d5bce4e60381afbf3b4d101d00a71f5511  0008-native-jm-bo-lifetime.patch
+7968f10fba3d79ecbb0901a94aec01f5f24dc677770b20dd8b05084dfe593ec418c39a8d8cb8962186b6044c99355bf6d76faa727685ff070a81d07e1394f256  0009-egl-dmabuf-export-failure.patch
+4df14e162abffdeaa9d91b63288fdc053abee155c25ea9135f4821926c4b2e05f3f5f52c0f9685b19f8de2cfe31a68215dcdba61b7d292d35349894b4e968f08  0010-native-jm-external-write-fences.patch
+826812ac93a9d6ba9ef201882c9857ac750ec765c5eca5008a0e89a771e964c107d1b5712899146abd36db9a60c431071af8c9957fb38dce94ed938b2e811885  0011-kbase-exportable-egl-images.patch
+b0fc535770e04d7cbfa039c9f30e0305041e69727194fa7efaa78993ff1851e593be6af139a6c3752ca6daadd7d7302f2b5367a9e129f492d406c1481367597b  0012-egl-surfaceless-primary-node.patch
+"

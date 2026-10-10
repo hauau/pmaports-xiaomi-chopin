@@ -1,0 +1,26 @@
+Subject: [PATCH] egl: fail DMA-BUF export when the image has no exportable fd
+
+Native kbase allocations cannot be exported as DMA-BUFs; imported display
+buffers can. Do not report successful EGL export with the first fd still
+set to -1. GTK then uses its existing GL texture path instead of building
+an invalid DMA-BUF texture. Release the display lock on every failure.
+
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -3090,2 +3090,4 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img,
+-   if (!dri2_can_export_dma_buf_image(disp, img))
++   if (!dri2_can_export_dma_buf_image(disp, img)) {
++      mtx_unlock(&dri2_dpy->lock);
+       return EGL_FALSE;
++   }
+@@ -3104,4 +3106,7 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img,
+    /* rework later to provide multiple fds/strides/offsets */
+-   if (fds)
+-      dri2_dpy->image->queryImage(dri2_img->dri_image,
+-                                  __DRI_IMAGE_ATTRIB_FD, fds);
++   if (fds && !dri2_dpy->image->queryImage(dri2_img->dri_image,
++                                           __DRI_IMAGE_ATTRIB_FD, fds)) {
++      mtx_unlock(&dri2_dpy->lock);
++      return EGL_FALSE;
++   }
++

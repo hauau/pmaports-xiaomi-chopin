@@ -1,0 +1,118 @@
+From: chopin postmarketOS bring-up
+Subject: [PATCH] kbase: complete JM sequence fences and honor wait deadlines
+
+JM events carry the completed submission sequence, while the common fence
+checks track the first sequence not yet completed. Advance JM's completion
+counter instead of waiting for an unrelated future reuse of the atom slot.
+
+Use Gallium's requested fence timeout, including infinite buffer waits;
+never replace glFinish with the backend's fixed one-second deadline.
+
+--- a/src/panfrost/base/pan_base.h
++++ b/src/panfrost/base/pan_base.h
+@@ -184,8 +184,8 @@ struct kbase_ {
+         struct kbase_syncobj *(*syncobj_create)(kbase k);
+         void (*syncobj_destroy)(kbase k, struct kbase_syncobj *o);
+         struct kbase_syncobj *(*syncobj_dup)(kbase k, struct kbase_syncobj *o);
+-        /* TODO: timeout? (and for cs_wait) */
+-        bool (*syncobj_wait)(kbase k, struct kbase_syncobj *o);
++        bool (*syncobj_wait)(kbase k, struct kbase_syncobj *o,
++                            int64_t timeout_ns);
+ 
+         /* Returns false if there are no active queues */
+         bool (*callback_all_queues)(kbase k, int32_t *count,
+--- a/src/panfrost/base/pan_base.c
++++ b/src/panfrost/base/pan_base.c
+@@ -179,8 +179,0 @@
+-static void
+-adjust_time(struct timespec *tp, int64_t ns)
+-{
+-        ns += tp->tv_nsec;
+-        tp->tv_nsec = ns % 1000000000;
+-        tp->tv_sec += ns / 1000000000;
+-}
+-
+@@ -214,11 +206,16 @@ kbase_wait_init(kbase k, int64_t timeout_ns)
+         struct timespec tp;
+         clock_gettime(CLOCK_MONOTONIC, &tp);
+ 
+-        adjust_time(&tp, timeout_ns);
++        int64_t now = tp.tv_sec * 1000000000LL + tp.tv_nsec;
++        int64_t deadline = (timeout_ns < 0 || timeout_ns > INT64_MAX - now)
++                ? INT64_MAX : now + timeout_ns;
+ 
+         return (struct kbase_wait_ctx) {
+                 .k = k,
+-                .until = tp,
++                .until = {
++                        .tv_sec = deadline / 1000000000LL,
++                        .tv_nsec = deadline % 1000000000LL,
++                },
+         };
+ }
+ 
+--- a/src/panfrost/base/pan_vX_base.c
++++ b/src/panfrost/base/pan_vX_base.c
+@@ -862,7 +862,8 @@ kbase_syncobj_update(kbase k, struct kbase_syncobj *o)
+ }
+ 
+ static bool
+-kbase_syncobj_wait(kbase k, struct kbase_syncobj *o)
++kbase_syncobj_wait(kbase k, struct kbase_syncobj *o,
++                  int64_t timeout_ns)
+ {
+         if (list_is_empty(&o->fences)) {
+                 LOG("syncobj has no fences\n");
+@@ -869,7 +870,7 @@ kbase_syncobj_wait(kbase k, struct kbase_syncobj *o)
+                 return true;
+         }
+ 
+-        struct kbase_wait_ctx wait = kbase_wait_init(k, 1 * 1000000000LL);
++        struct kbase_wait_ctx wait = kbase_wait_init(k, timeout_ns);
+ 
+         while (kbase_wait_for_event(&wait)) {
+                 kbase_syncobj_update(k, o);
+@@ -936,7 +937,8 @@ kbase_handle_events(kbase k)
+ 
+                 pthread_mutex_lock(&k->handle_lock);
+ 
+-                k->event_slots[event.atom_number].last = event.udata.blob[0];
++                /* Fence checks track the next unfinished sequence. */
++                k->event_slots[event.atom_number].last = event.udata.blob[0] + 1;
+ 
+                 unsigned size = util_dynarray_num_elements(&k->gem_handles,
+                                                            kbase_handle);
+@@ -1494,7 +1496,7 @@ kbase_cs_wait(kbase k, struct kbase_cs *cs, uint64_t extract_offset,
+         if (!cs->user_io)
+                 return false;
+ 
+-        if (kbase_syncobj_wait(k, o))
++        if (kbase_syncobj_wait(k, o, 1000000000LL))
+                 return true;
+ 
+         uint64_t e = CS_READ_REGISTER(cs, CS_EXTRACT);
+--- a/src/gallium/drivers/panfrost/pan_fence.c
++++ b/src/gallium/drivers/panfrost/pan_fence.c
+@@ -69,8 +69,8 @@ panfrost_fence_finish(struct pipe_screen *pscreen,
+                 abs_timeout = INT64_MAX;
+ 
+         if (dev->kbase) {
+-                /* TODO: Use the timeout */
+-                bool ret = dev->mali.syncobj_wait(&dev->mali, fence->kbase);
++                bool ret = dev->mali.syncobj_wait(&dev->mali, fence->kbase,
++                                                  MIN2(timeout, (uint64_t) INT64_MAX));
+                 fence->signaled = ret;
+                 return ret;
+         }
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -805,7 +805,8 @@ panfrost_batch_submit(struct panfrost_batch *batch,
+         if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
+                 /* Wait so we can get errors reported back */
+                 if (dev->kbase)
+-                        dev->mali.syncobj_wait(&dev->mali, ctx->syncobj_kbase);
++                        dev->mali.syncobj_wait(&dev->mali, ctx->syncobj_kbase,
++                                              INT64_MAX);
+                 else
+                         drmSyncobjWait(dev->fd, &out_sync, 1,
+                                        INT64_MAX, 0, NULL);

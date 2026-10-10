@@ -1,0 +1,32 @@
+Subject: [PATCH] egl/surfaceless: use the primary node without a render node
+
+The chopin display driver exposes only a primary node (card0); the Mali GPU
+is driven through renderonly, which GBM already uses from card0. The
+surfaceless platform probed render nodes only, so eglInitialize() failed
+and WebKitGTK's web process, which renders through surfaceless EGL,
+aborted. Fall back to the primary node for devices without a render node.
+
+--- a/src/egl/drivers/dri2/platform_surfaceless.c
++++ b/src/egl/drivers/dri2/platform_surfaceless.c
+@@ -245,12 +245,19 @@
+       return false;
+ 
+    for (i = 0; i < num_devices; ++i) {
++      unsigned type = node_type;
++
+       device = devices[i];
+ 
+-      if (!(device->available_nodes & (1 << node_type)))
++      /* Display controllers whose GPU is driven through renderonly (kmsro)
++       * may expose no render node; open their primary node as GBM does. */
++      if (!swrast && !(device->available_nodes & (1 << DRM_NODE_RENDER)))
++         type = DRM_NODE_PRIMARY;
++
++      if (!(device->available_nodes & (1 << type)))
+          continue;
+ 
+-      dri2_dpy->fd = loader_open_device(device->nodes[node_type]);
++      dri2_dpy->fd = loader_open_device(device->nodes[type]);
+       if (dri2_dpy->fd < 0)
+          continue;
+ 
